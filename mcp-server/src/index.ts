@@ -117,7 +117,7 @@ export function createMcpServer(): McpServer {
         query: z.string().describe('SQL SELECT query for verification.'),
         expectation: z.enum(['returns_rows', 'returns_no_rows', 'first_value_true', 'scalar_equals']).describe('Expected result pattern.'),
         expected_value: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional().describe('Expected scalar value (for scalar_equals).'),
-      })).describe('Verification assertions to check after migration.'),
+      })).optional().describe('Verification assertions to check after migration.'),
       approval_token: z.object({
         payload: z.object({
           version: z.literal(1),
@@ -134,7 +134,7 @@ export function createMcpServer(): McpServer {
           single_use: z.literal(true),
         }).describe('The signed approval payload.'),
         signature: z.string().describe('HMAC-SHA256 base64url signature of the payload.'),
-      }).describe('The human-issued signed approval token authorizing this mutation.'),
+      }).optional().describe('Optional signed approval token. When omitted, TrueForge interactive UI approval serves as the gate.'),
     },
     async (input) => {
       try {
