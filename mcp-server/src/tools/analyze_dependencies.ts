@@ -76,11 +76,15 @@ export async function analyzeDependencies(
   return db.withTransaction(
     'prodReadonly',
     async (client) => {
-      const relation = await client.query<{ oid: string | null }>(
-        `SELECT to_regclass(format('%I.%I', 'public', $1))::oid::text AS oid`,
+      const relation = await client.query<{ oid: string }>(
+        `SELECT c.oid::text AS oid 
+           FROM pg_class c 
+           JOIN pg_namespace n ON n.oid = c.relnamespace 
+          WHERE n.nspname = 'public' AND c.relname = $1`,
         [table_name],
       );
       if (!relation.rows[0]?.oid) throw new Error(`public.${table_name} does not exist.`);
+      const tableOid = relation.rows[0].oid;
 
       const fkResult = await client.query<{
         constraint_name: string;
@@ -104,15 +108,14 @@ export async function analyzeDependencies(
                   JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = key.attnum
                   ORDER BY key.ord
                 ) AS target_columns,
-                CASE WHEN con.conrelid = to_regclass(format('%I.%I', 'public', $1))
+                CASE WHEN con.conrelid = $1::oid
                      THEN 'outbound' ELSE 'inbound' END AS direction,
                 pg_get_constraintdef(con.oid, true) AS definition
            FROM pg_constraint con
           WHERE con.contype = 'f'
-            AND (con.conrelid = to_regclass(format('%I.%I', 'public', $1))
-              OR con.confrelid = to_regclass(format('%I.%I', 'public', $1)))
+            AND (con.conrelid = $1::oid OR con.confrelid = $1::oid)
           ORDER BY con.conname`,
-        [table_name],
+        [tableOid],
       );
       const foreignKeys = fkResult.rows.filter((fk) =>
         !column_name || fk.source_columns.includes(column_name) || fk.target_columns.includes(column_name),
@@ -130,10 +133,10 @@ export async function analyzeDependencies(
            JOIN pg_rewrite rewrite ON rewrite.oid = dep.objid
            JOIN pg_class view_class ON view_class.oid = rewrite.ev_class
            JOIN pg_namespace view_ns ON view_ns.oid = view_class.relnamespace
-          WHERE dep.refobjid = to_regclass(format('%I.%I', 'public', $1))
+          WHERE dep.refobjid = $1::oid
             AND view_class.relkind IN ('v', 'm')
           ORDER BY view_name`,
-        [table_name],
+        [tableOid],
       );
 
       const functionsResult = await client.query<{
@@ -147,10 +150,10 @@ export async function analyzeDependencies(
            FROM pg_depend dep
            JOIN pg_proc proc ON proc.oid = dep.objid
            JOIN pg_namespace ns ON ns.oid = proc.pronamespace
-          WHERE dep.refobjid = to_regclass(format('%I.%I', 'public', $1))
+          WHERE dep.refobjid = $1::oid
             AND proc.prokind IN ('f', 'p')
           ORDER BY function_name`,
-        [table_name],
+        [tableOid],
       );
 
       const triggersResult = await client.query<{
@@ -163,10 +166,10 @@ export async function analyzeDependencies(
                 proc.proname AS function_name
            FROM pg_trigger trigger
            JOIN pg_proc proc ON proc.oid = trigger.tgfoid
-          WHERE trigger.tgrelid = to_regclass(format('%I.%I', 'public', $1))
+          WHERE trigger.tgrelid = $1::oid
             AND NOT trigger.tgisinternal
           ORDER BY trigger.tgname`,
-        [table_name],
+        [tableOid],
       );
 
       const indexesResult = await client.query<{
@@ -187,9 +190,9 @@ export async function analyzeDependencies(
                 ) AS columns
            FROM pg_index idx
            JOIN pg_class index_class ON index_class.oid = idx.indexrelid
-          WHERE idx.indrelid = to_regclass(format('%I.%I', 'public', $1))
+          WHERE idx.indrelid = $1::oid
           ORDER BY index_class.relname`,
-        [table_name],
+        [tableOid],
       );
       const indexes = indexesResult.rows.filter((index) =>
         !column_name || index.columns.some((column) => column.replaceAll('"', '') === column_name),
@@ -208,9 +211,9 @@ export async function analyzeDependencies(
                 pg_get_expr(pol.polqual, pol.polrelid) AS using_expression,
                 pg_get_expr(pol.polwithcheck, pol.polrelid) AS check_expression
            FROM pg_policy pol
-          WHERE pol.polrelid = to_regclass(format('%I.%I', 'public', $1))
+          WHERE pol.polrelid = $1::oid
           ORDER BY pol.polname`,
-        [table_name],
+        [tableOid],
       );
 
       const sequencesResult = await client.query<{ sequence_name: string }>(
@@ -218,10 +221,10 @@ export async function analyzeDependencies(
            FROM pg_depend dep
            JOIN pg_class seq ON seq.oid = dep.objid AND seq.relkind = 'S'
            JOIN pg_namespace seq_ns ON seq_ns.oid = seq.relnamespace
-          WHERE dep.refobjid = to_regclass(format('%I.%I', 'public', $1))
+          WHERE dep.refobjid = $1::oid
             AND dep.deptype IN ('a', 'i')
           ORDER BY sequence_name`,
-        [table_name],
+        [tableOid],
       );
 
       const total =
