@@ -1,6 +1,6 @@
 /**
  * In-process unit tests of the security primitives (no DB, no HTTP).
- * Imports Kiro's source read-only; nothing is written into mcp-server/.
+ * Imports the server source read-only; nothing is written into mcp-server/.
  */
 import { describe, expect, it } from 'vitest';
 import crypto from 'node:crypto';

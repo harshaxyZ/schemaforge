@@ -242,7 +242,7 @@ docker compose -p schemaforge-smoke up -d
 
 ## AI assistance disclosure
 
-This project used **Kiro IDE with Claude Opus 5** for repository analysis, implementation assistance, safety review, documentation, and validation. The human team owns the product decisions and must be able to explain the architecture and code. No AI-generated secret or credential is committed.
+This project used **Claude Opus 5** for repository analysis, implementation assistance, safety review, documentation, and validation. The human team owns the product decisions and must be able to explain the architecture and code. No AI-generated secret or credential is committed.
 
 ## References
 
