@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="220" height="220" viewBox="0 0 220 220" role="img" aria-labelledby="t">
+  <title id="t">SchemaForge logo</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1e3a8a"/>
+      <stop offset="1" stop-color="#0f172a"/>
+    </linearGradient>
+    <linearGradient id="spark" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fbbf24"/>
+      <stop offset="1" stop-color="#f97316"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="208" height="208" rx="44" fill="url(#bg)"/>
+  <!-- database cylinder -->
+  <g fill="none" stroke="#e0e7ff" stroke-width="8" stroke-linecap="round">
+    <ellipse cx="96" cy="62" rx="46" ry="14"/>
+    <path d="M50 62v76c0 7.7 20.6 14 46 14"/>
+    <path d="M142 62v30"/>
+    <path d="M50 100c0 7.7 20.6 14 46 14"/>
+  </g>
+  <!-- shield with check: the approval gate -->
+  <path d="M150 104l36 12v24c0 22-15.5 37-36 44-20.5-7-36-22-36-44v-24z" fill="url(#spark)"/>
+  <path d="M134 143l11 11 21-23" fill="none" stroke="#0f172a" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
