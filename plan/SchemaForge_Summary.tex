@@ -1,0 +1,139 @@
+% SchemaForge v2.0 --- Two-page executive summary
+% Compile: tectonic SchemaForge_Summary.tex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=black,urlcolor=black]{hyperref}
+\usepackage{titlesec}
+
+\definecolor{sfnavy}{HTML}{16324F}
+\definecolor{sfrule}{HTML}{B8C4D0}
+
+\titleformat{\section}{\normalfont\large\bfseries\color{sfnavy}}{}{0pt}{}
+\titlespacing*{\section}{0pt}{1.4ex plus .2ex}{0.7ex}
+
+\setlist[itemize]{leftmargin=1.3em,itemsep=0.25ex,topsep=0.4ex}
+\renewcommand{\arraystretch}{1.15}
+\pagestyle{empty}
+
+\begin{document}
+
+\begin{center}
+  {\color{sfnavy}\Large\bfseries SchemaForge v2.0 --- Summary}\\[0.4ex]
+  {\small Autonomous Database Migration Reliability Agent}\\[0.2ex]
+  {\footnotesize TrueFoundry $\times$ Polaris ``Agents That Act'' \textperiodcentered\ 26 September 2026}
+\end{center}
+\vspace{0.4ex}
+{\color{sfrule}\hrule height 1pt}
+\vspace{1.6ex}
+
+\section*{What it is}
+SchemaForge turns a plain-English migration request into an evidence-backed decision. TrueForge
+drives the loop: the agent inspects the live PostgreSQL target, maps dependencies, synthesises
+forward and rollback SQL, rehearses it against a copy of real data, and produces a decision packet.
+Then it stops. Production is only changed after a human signs an approval bound to that exact
+migration.
+
+\section*{The boundary}
+Write credentials never sit in the agent loop. Two MCP servers run with different secrets:
+\textbf{sf-core} holds read-only and shadow access; \textbf{sf-executor} holds the single
+production write role and the approval key. A separate terminal tool signs approvals. The
+executor re-checks the signature, the SQL hash, the schema fingerprint, and a single-use
+ledger before it applies anything. Forged, edited, expired, replayed, or stale approvals are
+each rejected with their own code.
+
+\section*{Plan}
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}llp{7.2cm}@{}}
+\toprule
+\textbf{Phase} & \textbf{Time} & \textbf{Outcome} \\
+\midrule
+0 Unblock          & 1.5 h & Config, transactions and demo data actually work \\
+1 Safety core      & 2.0 h & SQL classifier, signed approvals, executor split \\
+2 Rehearsal        & 1.5 h & Disposable shadow copies, deterministic verdicts \\
+3 Agent            & 1.0 h & TrueForge gate, prompt, approval CLI \\
+4 Tests            & 1.0 h & Twelve tests, one per safety claim \\
+5 Demo             & 0.5 h & Two dry runs, reset script, backup video \\
+\midrule
+\textbf{Total}     & \textbf{7.5 h} & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{Demo}
+Two requests, five minutes. Making \texttt{users.email} \texttt{NOT NULL} finds fourteen null
+rows in rehearsal and returns \textbf{DO NOT APPLY} with production untouched. Adding a nullable
+\texttt{archived\_at} column passes every check, freezes at the gate, and applies only after the
+human types the migration hash. Post-apply verification confirms the result. The refusal matters
+as much as the success.
+
+\section*{Done when}
+\begin{itemize}
+  \item Both scenarios run live against real PostgreSQL, no hand-written SQL.
+  \item The refusal is produced by rule code, not by model opinion.
+  \item Every rejection path has a passing automated test.
+  \item A stranger can clone the repository and reproduce the run.
+\end{itemize}
+
+\clearpage
+
+\section*{Where it stops}
+Six ways a production apply is refused. Each has its own rejection code and its own test.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}llp{6.6cm}@{}}
+\toprule
+\textbf{Attempt} & \textbf{Code} & \textbf{Caught by} \\
+\midrule
+Token signed with the wrong key & \texttt{BAD\_SIGNATURE}  & HMAC verify in the executor \\
+SQL edited after approval       & \texttt{HASH\_MISMATCH}  & Recomputed hash of the SQL \\
+Approval reused                 & \texttt{REPLAYED}        & Single-use ledger in the database \\
+Approval too old                & \texttt{EXPIRED}         & Short time-to-live on the payload \\
+Schema changed since rehearsal  & \texttt{SCHEMA\_DRIFT}   & Fingerprint recaptured before apply \\
+Prohibited statement            & \texttt{PROHIBITED}      & Parser, plus a restricted write role \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{How the verdict is decided}
+Fixed rules, first match wins. The model explains the verdict; it cannot change it.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lp{4.1cm}@{}}
+\toprule
+\textbf{Evidence} & \textbf{Verdict} \\
+\midrule
+Prohibited or unparseable statement      & DO NOT APPLY \\
+Rehearsal failed, or violations found    & DO NOT APPLY \\
+Invariant check failed after migration   & DO NOT APPLY \\
+Schema drifted, or rollback unproven     & REVIEW \\
+Application references flagged           & REVIEW \\
+Everything green                         & APPLY \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{Stack}
+TrueForge harness, two MCP servers in TypeScript, PostgreSQL 16 in Docker Compose, a terminal
+approval tool. No mocked responses: the databases, roles, rehearsal and migration are real.
+
+\section*{Not building}
+Multi-database support, Kubernetes, chat integrations, a login system, a web UI, multi-agent
+orchestration, or automatic rollback of changes that cannot be reversed.
+
+\vfill
+{\color{sfrule}\hrule height 0.4pt}
+\vspace{0.8ex}
+\noindent{\footnotesize Full detail: \texttt{SchemaForge\_Implementation\_Plan.pdf} --- current-state
+findings, architecture, phase tasks with acceptance criteria, schedule, risk register and file
+change map.}
+
+\end{document}

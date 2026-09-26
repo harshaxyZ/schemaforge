@@ -1,0 +1,20 @@
+{
+  "name": "@schemaforge/verification",
+  "version": "2.0.0",
+  "description": "SchemaForge v2.0 – schema verification and invariant-check modules",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rimraf dist"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.6.3",
+    "rimraf": "^6.0.1"
+  }
+}

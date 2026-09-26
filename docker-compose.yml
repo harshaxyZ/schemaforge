@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+  schemaforge-prod:
+    image: postgres:16-alpine
+    container_name: schemaforge-prod
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: schemaforge_prod
+      POSTGRES_USER: sf_admin
+      POSTGRES_PASSWORD: sf_admin_pass
+    volumes:
+      - schemaforge-prod-data:/var/lib/postgresql/data
+      - ./docker/init-prod.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    networks:
+      - schemaforge-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sf_admin -d schemaforge_prod"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  schemaforge-shadow:
+    image: postgres:16-alpine
+    container_name: schemaforge-shadow
+    restart: unless-stopped
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_DB: schemaforge_shadow
+      POSTGRES_USER: sf_shadow
+      POSTGRES_PASSWORD: sf_shadow_pass
+    volumes:
+      - schemaforge-shadow-data:/var/lib/postgresql/data
+      - ./docker/init-shadow.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    networks:
+      - schemaforge-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sf_shadow -d schemaforge_shadow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  schemaforge-prod-data:
+    driver: local
+  schemaforge-shadow-data:
+    driver: local
+
+networks:
+  schemaforge-net:
+    driver: bridge

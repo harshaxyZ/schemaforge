@@ -1,0 +1,91 @@
+###############################################################################
+# SchemaForge v2.0 — TrueForge Agent Configuration
+# Autonomous Database Migration Reliability Agent
+# TrueFoundry × Polaris "Agents That Act" Hackathon
+###############################################################################
+
+agent:
+  name: SchemaForge
+  version: "2.0"
+  description: "Autonomous Database Migration Reliability Agent"
+
+# ---------------------------------------------------------------------------
+# Model configuration
+# ---------------------------------------------------------------------------
+model:
+  provider: "openai"  # or anthropic/google
+  model: "${LLM_MODEL}"
+  temperature: 0.1  # Low temperature for deterministic reasoning
+  max_tokens: 4096
+
+# ---------------------------------------------------------------------------
+# MCP server — bridges the agent to PostgreSQL via typed tool calls
+# ---------------------------------------------------------------------------
+mcp:
+  server:
+    command: "node"
+    args: ["mcp-server/dist/index.js"]
+    env:
+      PROD_DATABASE_URL: "${PROD_DATABASE_URL}"
+      PROD_READONLY_URL: "${PROD_READONLY_URL}"
+      SHADOW_DATABASE_URL: "${SHADOW_DATABASE_URL}"
+
+# ---------------------------------------------------------------------------
+# Safety tiers — every tool and operation is classified
+# ---------------------------------------------------------------------------
+safety:
+  tiers:
+    # Tier 0 — read-only, no mutation risk
+    - tier: 0
+      label: "Safe autonomous"
+      tools:
+        - "db_inspect_schema"
+        - "db_run_readonly_query"
+        - "analyze_dependencies"
+        - "verify_production"
+      requires_approval: false
+
+    # Tier 1 — sandbox-only mutations, locally reversible
+    - tier: 1
+      label: "Local / reversible"
+      tools:
+        - "rehearse_migration"
+      requires_approval: false
+      audit: true
+
+    # Tier 2 — production mutation, requires explicit human approval
+    - tier: 2
+      label: "Consequential"
+      tools:
+        - "execute_migration"
+      requires_approval: true
+      approval_mode: "action_bound"
+
+    # Tier 3 — unconditionally rejected, no approval path exists
+    - tier: 3
+      label: "Prohibited"
+      operations:
+        - "DROP TABLE"
+        - "TRUNCATE"
+        - "DROP DATABASE"
+        - "ALTER ROLE"
+        - "GRANT"
+        - "REVOKE"
+      action: "reject"
+
+# ---------------------------------------------------------------------------
+# Lifecycle limits
+# ---------------------------------------------------------------------------
+lifecycle:
+  max_tool_calls: 50
+  session_timeout_minutes: 30
+  preserve_state_on_gate: true
+
+# ---------------------------------------------------------------------------
+# Approval gate — action-bound, single-use, fingerprint-verified
+# ---------------------------------------------------------------------------
+approval:
+  token_expiry_seconds: 300
+  single_use: true
+  require_schema_fingerprint_match: true
+  default_decision: "reject"  # No pre-selected approval
