@@ -4,6 +4,8 @@
 
 Built for the [TrueFoundry × Polaris “Agents That Act” hackathon](https://hackculture.io/hackathons/agents-that-act). SchemaForge turns a natural-language database change into an evidence-backed migration decision: it inspects a real PostgreSQL target, maps dependencies, runs generated SQL inside a rollback-only shadow sandbox, verifies explicit assertions and rollback equivalence, then freezes at a human approval checkpoint.
 
+The full write-up — problem, architecture, stop conditions, TrueForge usage, real-world application and known limitations — is in [`SchemaForge_Summary.pdf`](SchemaForge_Summary.pdf) (two pages).
+
 > SchemaForge is not a free-running SQL generator. The model proposes; tools measure; policy constrains; a human decides.
 
 ## Why it fits the challenge
@@ -218,7 +220,7 @@ mcp-server/src/
 shadow/                    shared deterministic demo seed + reset helpers
 trueforge-config/          TrueForge spec reference and agent instructions
 verification/              standalone verification prototypes
-plan/                      design and implementation-plan sources/PDFs
+SchemaForge_Summary.tex    source for the two-page project summary PDF
 ```
 
 ## Validation
