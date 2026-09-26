@@ -1,498 +1,409 @@
-<p align="center">
-  <img width="180" alt="SchemaForge logo" src="docs/assets/logo.svg" />
-</p>
-
-<h1 align="center">SchemaForge</h1>
+Language: EN
 
 <p align="center">
-  <img src="https://img.shields.io/badge/runs%20on-TrueForge%200.2.1-1e3a8a?style=for-the-badge" alt="Runs on TrueForge 0.2.1" />
-  <img src="https://img.shields.io/badge/PostgreSQL-16-336791?style=for-the-badge&logo=postgresql&logoColor=white" alt="PostgreSQL 16" />
-  <img src="https://img.shields.io/badge/MCP-Streamable%20HTTP-111827?style=for-the-badge" alt="MCP Streamable HTTP" />
-  <img src="https://img.shields.io/badge/license-MIT-2563eb?style=for-the-badge" alt="MIT license" />
+  <img width="200" alt="SchemaForge Logo" src="docs/assets/logo.svg" />
 </p>
 
 <p align="center">
-  <a href="https://github.com/harshaxyZ/schemaforge/actions/workflows/ci.yml"><img src="https://github.com/harshaxyZ/schemaforge/actions/workflows/ci.yml/badge.svg" alt="CI status" /></a>
+  <img src="https://img.shields.io/badge/TrueForge%20%7C%20PostgreSQL%2016%20%7C%20MCP-111827?style=for-the-badge" alt="TrueForge PostgreSQL MCP" />
+  <img src="https://img.shields.io/badge/open%20source-MIT-2563eb?style=for-the-badge" alt="MIT license" />
+  <img src="https://img.shields.io/badge/human-in%20the%20loop-f59e0b?style=for-the-badge" alt="Human in the loop" />
 </p>
 
-### Rehearse every migration. Prove what happened. Stop before production.
+### Ship database migrations with evidence, not hope
+**SchemaForge** is an **open-source migration agent** for **PostgreSQL** that rehearses every schema change on a shadow database, proves what happened, and **stops before production** until a human approves.
+**Accepting PRs.**
 
-**SchemaForge** is a TrueForge agent that turns a natural-language database change into an evidence-backed migration decision. It inspects a live PostgreSQL target, maps the dependency blast radius, runs the generated SQL inside a rollback-only shadow sandbox, checks explicit assertions and rollback equivalence, then **freezes** at a human approval checkpoint.
-
-> The model proposes. Tools measure. Policy constrains. A human decides.
-
-Built for the [TrueFoundry × Polaris "Agents That Act" hackathon](https://hackculture.io/hackathons/agents-that-act). The two-page write-up lives in [`SchemaForge_Summary.pdf`](SchemaForge_Summary.pdf).
+<img width="1280" alt="SchemaForge refusing an unsafe migration and freezing a safe one for approval" src="docs/media/hero.svg" />
 
 ---
-
-## Table of contents
-
-- [What is SchemaForge?](#what-is-schemaforge)
-- [Core features](#core-features)
-- [Architecture](#architecture)
-- [The nine-stage workflow](#the-nine-stage-workflow)
-- [Approval and execution](#approval-and-execution)
-- [Safety properties](#safety-properties)
-- [Installation](#installation)
-- [Usage: two-minute demo](#usage-two-minute-demo)
-- [MCP tools](#mcp-tools)
-- [Repository map](#repository-map)
-- [Validation](#validation)
-- [Limitations](#limitations)
-- [Documentation](#documentation)
-- [AI assistance disclosure](#ai-assistance-disclosure)
-- [License](#license)
+### Built for Agents That Act
+Built during the [TrueFoundry × Polaris "Agents That Act" hackathon](https://hackculture.io/hackathons/agents-that-act) and runs on [TrueForge](https://github.com/truefoundry/trueforge).
 
 ---
 
 ## What is SchemaForge?
 
-Schema changes are among the riskiest actions an agent can take. A migration that looks correct can fail on real data, take locks that stall traffic, or leave no clean way back. SchemaForge is not a free-running SQL generator. It is an evidence layer: every proposed change is rehearsed against a deterministic copy of production, measured, and turned into a decision packet a human can review.
+SchemaForge is a TrueForge agent that turns a plain-English database change into an evidence-backed decision. Instead of letting a model write SQL and run it against production, SchemaForge inspects the real database, runs the change on a disposable copy, checks the result, and hands a human a decision packet. The most useful answer is often "no".
 
-The most useful output is often the refusal. When the data says a change is unsafe, SchemaForge returns `DO_NOT_APPLY` and production is never touched.
+> The model proposes. Tools measure. Policy constrains. A human decides.
 
-### How it meets the challenge
+SchemaForge runs on:
 
-| Hackathon requirement | SchemaForge proof |
-|---|---|
-| Runs on TrueForge | One TrueForge agent with two remote Streamable HTTP MCP connectors, provisioned through the TrueForge API by `scripts/trueforge/provision.mjs`. |
-| Reaches a real system | Read-only and executor PostgreSQL roles connect to a live PostgreSQL 16 target. |
-| Runs generated code safely | Generated SQL runs first in a separate shadow database, inside one transaction that is always rolled back. TrueForge's Daytona sandbox is available for helper code. |
-| Stops before irreversible action | `execute_migration` is marked `destructiveHint: true` and gated by TrueForge. The executor also demands a signed, short-lived token bound to the exact SQL and assertions. |
-| Protects credentials and data | Env files, keys, build output and runtime state are git-ignored. The model-facing process never receives production write credentials or the signing key. |
-| Discloses AI tools | See [AI assistance disclosure](#ai-assistance-disclosure). |
+- **TrueForge** 0.2.1 (local, `npx @truefoundry/trueforge`)
+- **PostgreSQL** 16 (production and shadow, via Docker Compose)
+- **Node.js** 22.14+ on Windows, macOS or Linux
 
----
+Platform notes:
 
-# Core features
-
-## Shadow rehearsal with real evidence
-Generated SQL runs on a shadow database seeded from the same deterministic file as production. SchemaForge records duration, locks, notices and row deltas, confirms the rollback actually happened, and destroys a poisoned connection instead of reusing it.
-
-## Assertions, not vibes
-Every verification query declares its expected outcome: `first_value_true`, `scalar_equals`, `returns_rows` or `returns_no_rows`. A query that merely runs without error never counts as a pass.
-
-## Exact-action approval
-A human mints an HMAC-SHA256 token that covers the SQL hash, assertion-set hash, baseline and expected fingerprints, rehearsal ID, target, nonce and expiry. Change one byte of the SQL and the token no longer applies.
-
-## Structural credential separation
-The split lives in configuration validation, not in a prompt. A process that holds a credential it should not have refuses to boot.
+- **Core server** holds read-only and shadow credentials only. It cannot write production.
+- **Executor server** holds the only production write role and exposes one destructive tool.
+- **Approval CLI** holds the signing key and no database URL at all.
 
 ---
 
-## All features
+# Core Features
 
-### Inspection and analysis
-- Stable catalog fingerprint (SHA-256) taken under `REPEATABLE READ`
-- Bounded `SELECT` and read-only CTE queries through the `sf_reader` role
-- Dependency blast radius across foreign keys, views, functions, triggers, indexes and policies
-
-### Rehearsal and verification
-- Forward SQL, assertions, lock observation, fingerprints and rollback on one shadow session
-- Unconditional outer `ROLLBACK`, even on success
-- Rollback-equivalence check against the baseline fingerprint
-- Verdict computed in code: `APPLY`, `REVIEW` or `DO_NOT_APPLY`
-
-### Policy
-- Fail-closed, schema-only SQL allowlist
-- Rejects tier-3 operations, procedural escape hatches, DML, ledger access, ambiguous escaped literals and mixed or non-transactional plans
-
-### Execution
-- Two human gates: a signed token plus TrueForge Allow/Deny
-- Single-use nonce claimed atomically in a production ledger
-- Drift check against the rehearsed baseline before any DDL
-- Advisory-lock serialization with statement and lock timeouts
-- DDL, approved assertions, post-fingerprint check and ledger update in one transaction
-
----
-
-# Architecture
-
-Two role-separated MCP servers (TypeScript, Streamable HTTP) attach to one TrueForge agent. The model-facing half physically cannot write production or mint an approval.
-
-```mermaid
-flowchart TB
-    human["👤 Human operator<br/>objective + decision"]
-    cli["🔑 Approval CLI<br/>npm run approve<br/>signing key + TTL only, no database URL"]
-    forge["TrueForge harness<br/>agent loop · session state · sandbox · Allow/Deny checkpoint"]
-
-    subgraph coreSvc["schemaforge-core :3100 · 5 tools"]
-        core["inspect · bounded read · dependencies<br/>rehearse · verify<br/>holds sf_reader + sf_shadow"]
-    end
-
-    subgraph execSvc["schemaforge-executor :3101 · 1 tool"]
-        exec["execute_migration<br/>destructiveHint: true<br/>holds sf_executor + approval key, no shadow"]
-    end
-
-    prodro[("Production :5433<br/>sf_reader, SELECT only")]
-    shadow[("Shadow :5434<br/>rollback-only transaction")]
-    prodrw[("Production :5433<br/>sf_executor, not superuser<br/>+ append-only execution ledger")]
-
-    human -->|natural-language objective| forge
-    human -. reads packet, signs exact SQL .-> cli
-    forge -->|autonomous| core
-    forge ==>|Allow / Deny| exec
-    cli -. signed token .-> exec
-    core --> prodro
-    core --> shadow
-    exec ==> prodrw
-
-    classDef danger fill:#fef2f2,stroke:#dc2626,color:#7f1d1d
-    classDef safe fill:#eff6ff,stroke:#2563eb,color:#1e3a8a
-    classDef store fill:#f8fafc,stroke:#475569,color:#0f172a
-    class cli,exec,prodrw danger
-    class core,forge safe
-    class prodro,shadow store
-```
-
-### Credential split
-
-Each process gets only the secrets its role needs, and configuration validation refuses to start a process that holds more.
-
-| Env file | Process | Holds | Never holds |
-|---|---|---|---|
-| `.env.core` | `schemaforge-core` | reader URL, shadow URL | write URL, approval secret |
-| `.env.executor` | `schemaforge-executor` | executor URL, approval secret | shadow URL |
-| `.env.approval` | approval CLI | approval secret | any database URL |
-
-Both databases run in Docker Compose and are seeded from the same deterministic file: 500 users, exactly 14 NULL emails, a three-row duplicate-email group, boundary foreign keys, and precision and zero-quantity edges. A rehearsal therefore starts from the fingerprint production actually has.
-
----
-
-# The nine-stage workflow
-
-Every request walks the same path. Stages 1 to 7 are autonomous and read-only or sandbox-only. Stage 8 is a hard stop. Stage 9 exists only after a human acts.
+## Shadow rehearsal on real-shaped data
+Every migration runs first on a shadow database seeded from the same file as production, inside a transaction that is always rolled back. SchemaForge records duration, locks, notices and row changes, then confirms the rollback actually happened.
 
 ```mermaid
 flowchart LR
-    s1["1 · Parse intent<br/>restate objective;<br/>ask, never guess"] --> s2["2 · Inspect<br/>catalog, version,<br/>baseline SHA-256"]
-    s2 --> s3["3 · Dependencies<br/>FKs, views, triggers,<br/>indexes, policies"]
-    s3 --> s4["4 · Synthesize<br/>byte-stable forward<br/>+ rollback SQL"]
-    s4 --> s5["5 · Rehearse (shadow)<br/>duration, locks,<br/>notices, row deltas"]
-    s5 --> s6["6 · Verify<br/>assertions + rollback<br/>equivalence"]
-    s6 --> s7{"7 · Assess<br/>verdict computed<br/>in code"}
-    s7 -->|any failure| stop["⛔ DO_NOT_APPLY<br/>production never touched"]
-    s7 -->|passes| s8["8 · FREEZE<br/>decision packet;<br/>no prod call this turn"]
-    s8 --> gate["🔐 Two human gates<br/>signed token<br/>+ TrueForge Allow"]
-    gate ==> s9["9 · Execute<br/>drift, DDL, assertions,<br/>post-hash: one transaction"]
-    s9 --> s10["✅ Verified + ledgered<br/>verify_production confirms"]
-
-    classDef danger fill:#fef2f2,stroke:#dc2626,color:#7f1d1d
-    classDef freeze fill:#eef2ff,stroke:#1e3a8a,stroke-width:2px,color:#1e3a8a
-    classDef ok fill:#f0fdf4,stroke:#16a34a,color:#14532d
-    class stop,gate,s9 danger
-    class s8 freeze
-    class s10 ok
+    sql["Generated SQL"] --> shadow[("Shadow DB :5434")]
+    shadow --> ev["Duration · locks · notices · row deltas"]
+    ev --> rb["ROLLBACK, always"]
+    rb --> fp["Fingerprint matches baseline?"]
 ```
 
----
-
-# Approval and execution
-
-After the freeze, nothing moves until a human reviews the packet, signs the exact action outside the agent, and then allows the tool call inside TrueForge.
+## Knows when to stop
+Assertions declare what must be true, and the verdict is computed in code. If any check fails, the answer is `DO_NOT_APPLY` and production is never touched.
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    actor H as Human
-    participant A as Approval CLI
-    participant T as TrueForge agent
-    participant X as schemaforge-executor
-    participant P as Production DB
-
-    T->>H: Decision packet (SQL, assertions, fingerprints, rehearsal ID)
-    H->>A: npm run approve ... --confirm
-    A-->>H: Signed token (5-minute TTL, single use)
-    H->>T: New message: apply unchanged SQL + token
-    T->>H: Allow / Deny card for execute_migration
-    H->>T: Allow
-    T->>X: execute_migration(sql, assertions, token)
-    X->>X: Verify HMAC, SQL hash, assertion hash, expiry
-    X->>P: Advisory lock + claim nonce in ledger
-    X->>P: Compare fingerprint to rehearsed baseline
-    alt drift detected
-        X-->>T: Abort, production unchanged
-    else baseline matches
-        X->>P: BEGIN, DDL, assertions, post-fingerprint
-        alt postcondition fails
-            X->>P: ROLLBACK
-            X-->>T: Rolled back, recorded in ledger
-        else all checks pass
-            X->>P: COMMIT + ledger success
-            X-->>T: Applied
-        end
-    end
-    Note over X,P: Reusing the token returns REPLAY_DETECTED
+flowchart LR
+    a["Assertions + rollback check"] --> v{"Verdict"}
+    v -->|any failure| stop["⛔ DO_NOT_APPLY"]
+    v -->|all pass| freeze["🧊 FREEZE for review"]
 ```
+
+## Two human gates before production
+A human signs the exact SQL with a short-lived, single-use token outside the agent. TrueForge then pauses the destructive tool call with an Allow/Deny card. Change one byte of the SQL and the token stops working.
+
+```mermaid
+flowchart LR
+    packet["Decision packet"] --> sign["🔑 Human signs exact SQL"]
+    sign --> allow["✋ TrueForge Allow / Deny"]
+    allow --> exec["Execute in one transaction"]
+```
+
+## Role separation you can't prompt around
+Credentials are split across three processes, and each one refuses to start if it holds a secret it should not have. The part of the system the model talks to physically cannot write production.
 
 ---
 
-# Safety properties
+## All Features
 
-1. **Fail-closed, schema-only SQL policy.** Tier-3 operations, procedural escape hatches, DML, internal-ledger access, ambiguous escaped literals, unknown statements and mixed or non-transactional plans are rejected in code.
-2. **Deterministic sandbox.** Forward SQL, assertions, lock observation, fingerprints and rollback run on one shadow session. An outer `ROLLBACK` runs even on success.
-3. **Assertions, not vibes.** Every verification query declares an expected outcome. Returning without error never passes.
-4. **Exact-action approval.** HMAC-SHA256 covers SQL hash, assertion-set hash, baseline and expected fingerprints, rehearsal ID, action, target, nonce, issue time, expiry and single-use intent.
-5. **Replay and drift protection.** The nonce is claimed atomically in a production ledger. Execution aborts if production no longer matches the rehearsed baseline.
-6. **Postcondition before commit.** If the production post-fingerprint differs from the rehearsed one, the migration transaction rolls back.
-7. **Two human boundaries.** A human mints the exact token after reading the decision packet, then TrueForge independently pauses the destructive MCP call with Allow/Deny.
+### Inspection
+
+- Stable SHA-256 schema fingerprint of the live catalog
+- Bounded read-only queries through the `sf_reader` role
+- Dependency blast radius across foreign keys, views, triggers, functions, indexes and policies
+
+### Rehearsal
+
+- Forward SQL, assertions and rollback on one shadow session
+- Outer `ROLLBACK` even on success
+- Lock observation, notices and row-count deltas
+- Rollback-equivalence check against the baseline fingerprint
+- Poisoned connections destroyed instead of reused
+
+### Verification
+
+- Explicit assertion outcomes: `first_value_true`, `scalar_equals`, `returns_rows`, `returns_no_rows`
+- A query that only runs without error never counts as a pass
+- Verdict computed in code: `APPLY`, `REVIEW` or `DO_NOT_APPLY`
+
+### SQL Policy
+
+- Fail-closed, schema-only allowlist
+- Blocks DML, procedural escape hatches, ledger access and ambiguous escaped literals
+- Rejects mixed or non-transactional plans
+
+### Approval
+
+- HMAC-SHA256 token bound to the SQL hash, assertion hash, fingerprints, rehearsal ID and target
+- Five-minute expiry and single-use nonce
+- Second gate in TrueForge through `destructiveHint: true`
+
+### Execution
+
+- Drift check against the rehearsed baseline before any DDL
+- Advisory lock, statement timeout and lock timeout
+- DDL, assertions, post-fingerprint and ledger update in one transaction
+- Replay attempts return `REPLAY_DETECTED`
+
+### Workflow
+
+- One-command TrueForge provisioning and a PASS/FAIL health check
+- Deterministic demo seed with deliberate edge cases
+- CI with build, secret scan, end-to-end tests and PDF build
+
+---
+
+# Screenshots
+
+<p align="center">
+  <img src="docs/media/summary-page-1.png" width="700" alt="SchemaForge project summary, page 1: problem and architecture">
+</p>
+
+<p align="center">
+  <img src="docs/media/summary-page-2.png" width="700" alt="SchemaForge project summary, page 2: workflow, TrueForge usage and limitations">
+</p>
 
 ---
 
 # Installation
 
-## Prerequisites
+## Build from source
 
-| Requirement | Version | Notes |
-|---|---|---|
-| **Node.js** | 22.14+ | TrueForge requirement |
-| **Docker Desktop** | Compose v2 | Runs the production and shadow databases |
-| **Model credential** | Any TrueForge-supported provider | Added in the TrueForge UI, never in this repo |
-| **Daytona credential** | Optional | Enables TrueForge's helper-code sandbox |
+### Prerequisites
 
-## 1. Install and configure
+- **Node.js** 22.14+
+- **Docker Desktop** with Compose v2
+- A **model credential** supported by TrueForge (added in the TrueForge UI, never in this repo)
+- Optional: a **Daytona** credential for TrueForge's code sandbox
 
-```powershell
+### Steps
+
+```bash
 git clone https://github.com/harshaxyZ/schemaforge.git
-Set-Location schemaforge
+cd schemaforge
 npm run setup
 npm run build
-Copy-Item config/core.env.example .env.core
-Copy-Item config/executor.env.example .env.executor
-Copy-Item config/approval.env.example .env.approval
+cp config/core.env.example .env.core
+cp config/executor.env.example .env.executor
+cp config/approval.env.example .env.approval
 ```
 
 Generate one signing secret and put the same value in `.env.executor` and `.env.approval`:
 
-```powershell
-[Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLower()
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ```
 
-> [!CAUTION]
-> Never paste the signing secret into TrueForge, chat, source code or a demo video.
+Start the databases and both MCP servers (one terminal each):
 
-## 2. Start the demo databases
-
-```powershell
+```bash
 docker compose up -d
-docker compose ps
+npm run start:core        # http://127.0.0.1:3100/mcp
+npm run start:executor    # http://127.0.0.1:3101/mcp
 ```
 
-The canonical seed is mounted into both databases. Existing named volumes keep old state. If you intentionally want to discard local demo data, run `docker compose down -v` first.
+---
 
-## 3. Start the MCP services
+## Connect to TrueForge
 
-Run each in its own terminal:
+Start TrueForge, open http://localhost:8790, and add your model under **Settings → Models**:
 
-```powershell
-npm run start:core
-```
-
-```powershell
-npm run start:executor
-```
-
-| Service | Health | MCP endpoint |
-|---|---|---|
-| core | `http://127.0.0.1:3100/health` | `http://127.0.0.1:3100/mcp` |
-| executor | `http://127.0.0.1:3101/health` | `http://127.0.0.1:3101/mcp` |
-
-## 4. Configure TrueForge
-
-Start the pinned harness and open `http://localhost:8790`:
-
-```powershell
+```bash
 npx @truefoundry/trueforge@0.2.1
 ```
 
-Add your model under **Settings → Models**, then provision the connectors and agent through the TrueForge API:
+Then provision the connectors and agent:
 
-```powershell
-node scripts/trueforge/provision.mjs --dry-run   # preview exactly what will be sent
+```bash
+node scripts/trueforge/provision.mjs --dry-run
 node scripts/trueforge/provision.mjs --model openai/gpt-5.2
-node scripts/trueforge/check.mjs                 # every line should print PASS
+node scripts/trueforge/check.mjs
 ```
 
-Pass `--sandbox` to `provision.mjs` after adding a Daytona provider under **Settings → Sandbox**. Flags and environment overrides are documented in [`scripts/trueforge/README.md`](scripts/trueforge/README.md).
-
-<details>
-<summary>Manual setup through the UI</summary>
-
-1. Add remote connector `schemaforge-core` with URL `http://127.0.0.1:3100/mcp`.
-2. Add remote connector `schemaforge-executor` with URL `http://127.0.0.1:3101/mcp`.
-3. Create agent **SchemaForge** and paste `trueforge-config/system-prompt.md` into Instructions.
-4. Attach both connectors using the tool selection in `trueforge-config/agent.yaml`.
-5. Require approval for `execute_migration`, enable Sandbox if configured, and save.
-
-</details>
+Every check should print `PASS`. See [`scripts/trueforge/README.md`](scripts/trueforge/README.md) for flags.
 
 ---
 
-# Usage: two-minute demo
+## "Connection refused" on :3100 or :3101
 
-## Path A: the agent knows when to stop
+The MCP servers are not running, or they refused to start. Check the terminal output: a server exits on purpose if its env file holds a credential its role must not have.
 
-Ask:
+```bash
+curl http://127.0.0.1:3100/health
+curl http://127.0.0.1:3101/health
+```
+
+---
+
+# System Requirements
+
+| Component | Minimum version | Notes |
+|---|---|---|
+| **Node.js** | 22.14 | Required by TrueForge. |
+| **Docker** | Compose v2 | Runs production (:5433) and shadow (:5434). |
+| **PostgreSQL** | 16 | Provided by the Compose file. |
+| **TrueForge** | 0.2.1 | MCP connectors must be remote HTTP. |
+
+> [!IMPORTANT]
+> Never paste the signing secret into TrueForge, chat, source code or a demo video.
+
+---
+
+# Usage
+
+## Ask
+
+1. Open the SchemaForge agent in TrueForge.
+2. Describe the change in plain English.
+3. Ask it to prove the change is safe before applying anything.
 
 > Make `users.email` NOT NULL and UNIQUE. Prove it is safe before applying anything.
 
-SchemaForge observes 14 NULLs and a three-row duplicate group. The naive constraint migration fails rehearsal or its assertions, and the verdict is `DO_NOT_APPLY`. No production tool call happens.
+## Review
 
-## Path B: a safe change through two approval gates
+SchemaForge inspects, maps dependencies, rehearses and verifies, then either refuses or freezes. In the demo seed, the request above finds 14 NULL emails and a three-row duplicate group, so the verdict is `DO_NOT_APPLY`.
 
-Ask:
+A safe request, such as adding an optional `phone VARCHAR(32)` column, ends in a frozen decision packet with:
 
-> Add an optional `phone VARCHAR(32)` column to users. Rehearse it, verify rollback, and prepare a decision packet.
+- the exact forward and rollback SQL
+- the assertion set and results
+- baseline and expected fingerprints
+- the rehearsal ID
 
-A valid rehearsal uses:
+## Approve
 
-```sql
--- forward
-ALTER TABLE users ADD COLUMN phone VARCHAR(32);
+Save the SQL and assertions from the packet, then sign them outside the agent:
 
--- rollback
-ALTER TABLE users DROP COLUMN phone;
-```
-
-with a machine-checkable `assertions.json`:
-
-```json
-[
-  {
-    "name": "phone column exists",
-    "query": "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'phone') AS ok",
-    "expectation": "first_value_true"
-  }
-]
-```
-
-After reviewing the frozen packet, save the exact forward SQL to `migration.sql` and the exact assertions to `assertions.json`, then mint a five-minute token outside the agent:
-
-```powershell
-npm run approve -- --sql-file migration.sql --assertions-file assertions.json `
-  --baseline <BASELINE_SHA256> --expected <POST_SHA256> `
+```bash
+npm run approve -- --sql-file migration.sql --assertions-file assertions.json \
+  --baseline <BASELINE_SHA256> --expected <POST_SHA256> \
   --rehearsal-id <REHEARSAL_ID> --action "Add optional users.phone column" --confirm
 ```
 
-Paste the token into a **new** TrueForge message and ask it to apply the unchanged SQL and assertions. TrueForge shows the Allow/Deny card. After Allow, the executor runs the flow in [Approval and execution](#approval-and-execution). Reusing the token returns `REPLAY_DETECTED`.
-
----
-
-# MCP tools
-
-| Connector | Tool | Annotation | Purpose |
-|---|---|---|---|
-| core | `db_inspect_schema` | read-only | Stable catalog fingerprint and schema evidence |
-| core | `db_run_readonly_query` | read-only | Bounded `SELECT` or read-only CTE through `sf_reader` |
-| core | `analyze_dependencies` | read-only | Foreign key, view, function, trigger and index blast radius |
-| core | `rehearse_migration` | write, non-destructive | Rollback-only shadow execution with observed evidence |
-| core | `verify_production` | read-only | Expected fingerprint plus explicit postcondition assertions |
-| executor | `execute_migration` | **destructive** | Signed one-shot apply with exact SQL and assertions and pre-commit postconditions |
-
----
-
-# Repository map
-
-```text
-config/                     role-specific env templates
-docker/                     production and shadow initialization
-docs/                       build story, demo run sheet, judge Q&A, reviews, logo
-e2e/                        Vitest security and black-box MCP/PostgreSQL scenarios
-.github/workflows/ci.yml    build, secret scan, e2e and PDF CI
-mcp-server/src/
-  cli/approve.ts            human-side HMAC token issuer
-  security/                 SQL policy and token verification
-  tools/                    six MCP tool implementations
-  config.ts                 fail-fast role and credential validation
-  db.ts                     connection-scoped transactions
-scripts/trueforge/          TrueForge provisioning and health check
-shadow/                     shared deterministic seed and reset helpers
-trueforge-config/           agent worksheet and system prompt
-verification/               standalone verification prototypes
-SchemaForge_Summary.tex     source for the two-page project summary PDF
-```
-
----
-
-# Validation
-
-```powershell
-npm run check
-npm run build
-npm test
-docker compose config --quiet
-```
-
-`npm test` always runs the security and MCP-over-HTTP surface checks. PostgreSQL scenarios skip when the databases are unavailable. CI sets `SF_E2E_REQUIRE_DB=1` against fresh PostgreSQL 16 service containers, so a missing database fails the run instead of passing silently.
-
-For an isolated smoke test that leaves your demo volumes alone:
-
-```powershell
-docker compose -p schemaforge-smoke up -d
-```
+Paste the token into a new TrueForge message and click **Allow** on the approval card. The executor applies the change and `verify_production` confirms it.
 
 ---
 
 # Limitations
 
-SchemaForge is a hackathon build. Open findings from [`docs/review/security-review.md`](docs/review/security-review.md) are listed here rather than hidden:
+### Shadow role
 
-- **SF-SEC-01 (High):** shadow rehearsal runs as a superuser, so some allowlisted DDL can cause side effects that survive the rollback. Planned fix: a non-superuser rehearsal role on an isolated network.
-- **SF-SEC-02 (Medium):** the read-only query check is a denylist, so some dangerous built-ins pass. Planned fix: rollback-only reads with a pinned `search_path`.
-- **SF-SEC-03 (Medium):** `/mcp` is unauthenticated when no API key is set. Planned fix: an always-required MCP API key.
-- Lower-severity items (a hash normalization gap, unicode-escaped ledger identifiers, concurrent out-of-band DDL) are documented in the same review.
+The shadow rehearsal currently runs as a superuser, so some allowlisted DDL can have side effects that survive the rollback (SF-SEC-01). A non-superuser rehearsal role on an isolated network is planned.
 
-> [!IMPORTANT]
-> Run SchemaForge only against local demo databases until SF-SEC-01 to SF-SEC-03 are fixed.
+### Read-only queries
+
+The read-only query check is a denylist, so some dangerous built-ins pass (SF-SEC-02). Rollback-only reads with a pinned `search_path` are planned.
+
+### MCP authentication
+
+`/mcp` is unauthenticated when no API key is set (SF-SEC-03). Set `SF_MCP_API_KEY` for anything beyond a local demo.
+
+Full details are in [`docs/review/security-review.md`](docs/review/security-review.md). Use local demo databases only until these are fixed.
 
 ---
 
-# Documentation
+# How It Works
 
-| Document | What it covers |
-|---|---|
-| [`SchemaForge_Summary.pdf`](SchemaForge_Summary.pdf) | Two-page project summary |
-| [`docs/BUILD_STORY.md`](docs/BUILD_STORY.md) | How the project evolved, pivots and timeline |
-| [`docs/DEMO_SCRIPT.md`](docs/DEMO_SCRIPT.md) | Five-minute demo run sheet |
-| [`docs/JUDGE_QA.md`](docs/JUDGE_QA.md) | Anticipated judge questions |
-| [`docs/review/`](docs/review/) | Correctness and security reviews |
-| [`scripts/trueforge/README.md`](scripts/trueforge/README.md) | TrueForge provisioning reference |
+SchemaForge combines a TrueForge agent loop with two role-separated MCP servers and a human-held signing key.
+
+```mermaid
+flowchart TB
+    human["👤 Human operator"]
+    cli["🔑 Approval CLI<br/>signing key only"]
+    forge["TrueForge agent<br/>loop · sandbox · Allow/Deny"]
+    core["schemaforge-core :3100<br/>inspect · query · dependencies<br/>rehearse · verify"]
+    exec["schemaforge-executor :3101<br/>execute_migration"]
+    prodro[("Production<br/>sf_reader, read-only")]
+    shadow[("Shadow<br/>rollback-only")]
+    prodrw[("Production<br/>sf_executor + ledger")]
+
+    human -->|objective| forge
+    human -. signs exact SQL .-> cli
+    forge -->|autonomous| core
+    forge ==>|Allow / Deny| exec
+    cli -. token .-> exec
+    core --> prodro
+    core --> shadow
+    exec ==> prodrw
+
+    classDef danger fill:#fef2f2,stroke:#dc2626,color:#7f1d1d
+    class cli,exec,prodrw danger
+```
+
+**Agent**
+- TrueForge runs the loop, keeps session state and shows the Allow/Deny card
+- The system prompt lives in `trueforge-config/system-prompt.md`
+
+**Core server**
+- Five tools: inspect, bounded read, dependencies, rehearse, verify
+- Holds only the `sf_reader` and `sf_shadow` roles
+
+**Executor server**
+- One tool, `execute_migration`, marked destructive
+- Verifies the token, claims the nonce, checks drift and applies in one transaction
+
+**Workflow**
+- Every request follows the same nine stages
+
+```mermaid
+flowchart LR
+    s1["1 Parse"] --> s2["2 Inspect"] --> s3["3 Dependencies"] --> s4["4 Synthesize"] --> s5["5 Rehearse"]
+    s5 --> s6["6 Verify"] --> s7{"7 Assess"}
+    s7 -->|fail| stop["⛔ DO_NOT_APPLY"]
+    s7 -->|pass| s8["8 FREEZE"] --> gate["🔐 Two human gates"] ==> s9["9 Execute"] --> done["✅ Verified"]
+```
+
+**Execution**
+- What happens after the human clicks Allow
+
+```mermaid
+sequenceDiagram
+    actor H as Human
+    participant T as TrueForge
+    participant X as Executor
+    participant P as Production
+    H->>T: Token + Allow
+    T->>X: execute_migration
+    X->>X: Check signature, hashes, expiry
+    X->>P: Lock, claim nonce, check drift
+    X->>P: BEGIN · DDL · assertions · post-hash
+    alt any check fails
+        X->>P: ROLLBACK
+    else all pass
+        X->>P: COMMIT + ledger
+    end
+```
+
+**Tests**
+- `npm test` runs security, MCP-over-HTTP and PostgreSQL scenarios
+- CI runs them against fresh PostgreSQL 16 containers
 
 ---
 
 # Contribution
 
-Contributions are welcome. Useful areas:
+Contributions are welcome.
+
+Areas where help is especially useful:
 
 - Closing SF-SEC-01 to SF-SEC-03
-- Running the database-backed test suite on every PR
-- Integration with Flyway or Liquibase as an evidence layer, so a PR that adds a migration gets a `READY FOR REVIEW` or `DO NOT APPLY` verdict with evidence attached
+- Running the database-backed tests on every PR
+- Flyway and Liquibase integration as an evidence layer
+- More assertion types and dependency checks
 
-Keep pull requests focused and run the [validation](#validation) commands before opening one.
-
----
-
-# AI assistance disclosure
-
-The hackathon rules require this disclosure.
-
-- **Claude Code** (Anthropic, Claude Opus 5) reviewed the v1 code, wrote the implementation plan, researched TrueForge's API, and wrote the provisioning scripts, CI workflow, end-to-end tests, security review and documentation.
-- **Kiro** implemented the core server changes in `mcp-server/`: signed approvals, the SQL policy, the HTTP transport, role separation, the executor ledger and the approval CLI.
-
-The human team owns the product decisions and can explain the architecture and code. No AI-generated secret or credential is committed. Details are in [`docs/BUILD_STORY.md`](docs/BUILD_STORY.md#how-we-used-ai-assistants).
+Please keep pull requests focused, run `npm run check && npm run build && npm test`, and avoid unrelated refactors.
 
 ---
 
-# References
+# Community
 
-- [Agents That Act: challenge and rules](https://hackculture.io/hackathons/agents-that-act)
-- [TrueForge repository](https://github.com/truefoundry/trueforge)
-- [TrueForge agent configuration and tool approval](https://trueforge.dev/create-agent/overview)
-- [TrueForge sandbox model](https://trueforge.dev/sandbox)
-- [Model Context Protocol tool annotations](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)
+Bug reports and feature requests:
+
+https://github.com/harshaxyZ/schemaforge/issues
+
+Pull requests are welcome.
+
+Project docs: [Build story](docs/BUILD_STORY.md) · [Demo script](docs/DEMO_SCRIPT.md) · [Judge Q&A](docs/JUDGE_QA.md) · [Summary PDF](SchemaForge_Summary.pdf)
 
 ---
 
 # License
 
-SchemaForge is licensed under the **MIT License**. See [`LICENSE`](LICENSE).
+SchemaForge is licensed under the **MIT License**.
+
+---
+
+# Credits
+
+## AI assistance
+
+The hackathon rules require this disclosure.
+
+- **Claude Code** (Anthropic, Claude Opus 5) reviewed the code, wrote the plan, the TrueForge provisioning scripts, CI, end-to-end tests, security review and docs.
+- **Kiro** built the core server changes in `mcp-server/`: signed approvals, SQL policy, HTTP transport, role separation, the executor ledger and the approval CLI.
+
+The team owns the product decisions and can explain the architecture and code. No secret or credential is committed.
+
+## Acknowledgements
+
+Built on [TrueForge](https://github.com/truefoundry/trueforge) and the [Model Context Protocol](https://modelcontextprotocol.io). README layout inspired by [Recordly](https://github.com/webadderallorg/recordly).
+
+Created by the SchemaForge team for Agents That Act 2026.
+
+---
