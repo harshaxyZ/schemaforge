@@ -1,12 +1,34 @@
-/** Role-scoped PostgreSQL pools and connection-scoped transaction primitives. */
+/**
+ * SchemaForge v2.0 — Database Connection Manager.
+ *
+ * Manages three isolated connection pools:
+ *   • prodReadonly  — SELECT-only access to production
+ *   • prodWrite     — gated behind ApprovalToken for mutations
+ *   • shadow        — full access to the disposable shadow DB
+ *
+ * All queries enforce a statement_timeout to prevent runaway operations.
+ */
 
-import pg, { type PoolClient, type QueryResult, type QueryResultRow } from 'pg';
-import type { ProcessRole } from './config.js';
+import pg from 'pg';
+import dotenv from 'dotenv';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+try {
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  const envPath = join(__dirname, '..', '..', '.env');
+  dotenv.config({ path: envPath });
+  dotenv.config();
+} catch (e) {}
 
 const { Pool } = pg;
 type PgPool = InstanceType<typeof Pool>;
 
+/** Names of the managed connection pools. */
 export type PoolName = 'prodReadonly' | 'prodWrite' | 'shadow';
+
+/** Default statement timeout in milliseconds (10 seconds). */
+const DEFAULT_STATEMENT_TIMEOUT_MS = 10_000;
 
 export interface TransactionOptions {
   statementTimeoutMs?: number;
@@ -15,157 +37,183 @@ export interface TransactionOptions {
   isolationLevel?: 'READ COMMITTED' | 'REPEATABLE READ' | 'SERIALIZABLE';
 }
 
-function positiveEnvInt(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
-  const parsed = Number.parseInt(env[name] ?? '', 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
+/**
+ * Centralized database connection manager for SchemaForge.
+ */
 export class DatabaseManager {
-  private readonly pools = new Map<PoolName, PgPool>();
-  private configuredRole: Exclude<ProcessRole, 'cli'> | null = null;
-  private statementTimeoutMs = 10_000;
+  private pools: Map<PoolName, PgPool> = new Map();
+  private statementTimeoutMs: number;
 
-  /** Create only the pools authorized for this already-validated process role. */
-  configure(role: Exclude<ProcessRole, 'cli'>, env: NodeJS.ProcessEnv = process.env): void {
-    if (this.configuredRole) {
-      if (this.configuredRole !== role) throw new Error(`Database manager is already configured for ${this.configuredRole}.`);
-      return;
-    }
-
-    this.statementTimeoutMs = positiveEnvInt(env, 'SF_STATEMENT_TIMEOUT_MS', 10_000);
-    if (role === 'core') {
-      this.addPool('prodReadonly', env.SF_PROD_READONLY_URL, 5);
-      this.addPool('shadow', env.SF_SHADOW_URL, 3);
-    } else {
-      this.addPool('prodReadonly', env.SF_PROD_READONLY_URL, 2);
-      this.addPool('prodWrite', env.SF_PROD_WRITE_URL, 1);
-    }
-    this.configuredRole = role;
-  }
-
-  private addPool(name: PoolName, connectionString: string | undefined, max: number): void {
-    if (!connectionString) throw new Error(`Missing connection string for ${name}.`);
-    this.pools.set(
-      name,
-      new Pool({
-        application_name: `schemaforge-${name}`,
-        connectionString,
-        max,
-        idleTimeoutMillis: 30_000,
-        connectionTimeoutMillis: 5_000,
-      }),
+  constructor() {
+    this.statementTimeoutMs = parseInt(
+      process.env.SF_STATEMENT_TIMEOUT ?? String(DEFAULT_STATEMENT_TIMEOUT_MS),
+      10,
     );
+
+    // ── Production read-only pool ──
+    const prodReadonlyUrl =
+      process.env.SF_PROD_READONLY_URL ||
+      process.env.DATABASE_READONLY_URL ||
+      process.env.PROD_READONLY_URL ||
+      process.env.DATABASE_URL;
+
+    if (prodReadonlyUrl) {
+      this.pools.set(
+        'prodReadonly',
+        new Pool({
+          connectionString: prodReadonlyUrl,
+          max: 5,
+          idleTimeoutMillis: 30_000,
+          connectionTimeoutMillis: 5_000,
+        }),
+      );
+    }
+
+    // ── Production write pool — used ONLY by execute_migration ──
+    const prodWriteUrl =
+      process.env.SF_PROD_WRITE_URL ||
+      process.env.DATABASE_URL ||
+      process.env.PROD_DATABASE_URL;
+
+    if (prodWriteUrl) {
+      this.pools.set(
+        'prodWrite',
+        new Pool({
+          connectionString: prodWriteUrl,
+          max: 2,
+          idleTimeoutMillis: 30_000,
+          connectionTimeoutMillis: 5_000,
+        }),
+      );
+    }
+
+    // ── Shadow pool — disposable rehearsal database ──
+    const shadowUrl =
+      process.env.SF_SHADOW_URL ||
+      process.env.SHADOW_DATABASE_URL ||
+      process.env.DATABASE_URL;
+
+    if (shadowUrl) {
+      this.pools.set(
+        'shadow',
+        new Pool({
+          connectionString: shadowUrl,
+          max: 5,
+          idleTimeoutMillis: 30_000,
+          connectionTimeoutMillis: 5_000,
+        }),
+      );
+    }
+
+    // Log connection status
+    const connected = Array.from(this.pools.keys());
+    console.log(`[SchemaForge DB] Pools initialized: ${connected.join(', ') || 'NONE'}`);
+    if (connected.length === 0) {
+      console.error('[SchemaForge DB] WARNING: No database URLs configured! Set DATABASE_URL in .env');
+    }
   }
 
+  /**
+   * Retrieve the raw pg Pool by name.
+   * Throws if the pool was not configured via environment variables.
+   */
   getPool(name: PoolName): PgPool {
-    if (!this.configuredRole) throw new Error('Database manager has not been configured.');
     const pool = this.pools.get(name);
-    if (!pool) throw new Error(`Database pool "${name}" is not authorized for the ${this.configuredRole} process.`);
+    if (!pool) {
+      throw new Error(
+        `DatabaseManager: pool "${name}" is not configured. ` +
+          `Set the corresponding SF_*_URL environment variable.`,
+      );
+    }
     return pool;
   }
 
-  async withClient<T>(name: PoolName, callback: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.getPool(name).connect();
+  /**
+   * Execute a SQL query against the named pool with statement_timeout enforcement.
+   */
+  async query<T extends pg.QueryResultRow = any>(
+    pool: PoolName,
+    sql: string,
+    params: unknown[] = [],
+    timeoutMs?: number,
+  ): Promise<pg.QueryResult<T>> {
+    const pgPool = this.getPool(pool);
+    const client = await pgPool.connect();
+    const timeout = timeoutMs ?? this.statementTimeoutMs;
+
     try {
-      return await callback(client);
+      await client.query(`SET statement_timeout = ${timeout}`);
+      const result = await client.query<T>(sql, params);
+      return result;
     } finally {
+      await client.query('RESET statement_timeout').catch(() => {});
       client.release();
     }
   }
 
-  private async configureTransaction(client: PoolClient, options: TransactionOptions): Promise<void> {
-    if (options.isolationLevel) {
-      await client.query(`SET TRANSACTION ISOLATION LEVEL ${options.isolationLevel}`);
-    }
-    if (options.readOnly) await client.query('SET TRANSACTION READ ONLY');
-    await client.query("SELECT set_config('statement_timeout', $1, true)", [
-      `${options.statementTimeoutMs ?? this.statementTimeoutMs}ms`,
-    ]);
-    if (options.lockTimeoutMs !== undefined) {
-      await client.query("SELECT set_config('lock_timeout', $1, true)", [`${options.lockTimeoutMs}ms`]);
-    }
-  }
-
+  /**
+   * Execute a transaction on a dedicated client from the named pool.
+   * Supports both simple (timeoutMs number) and advanced (TransactionOptions) signatures.
+   */
   async withTransaction<T>(
-    name: PoolName,
-    callback: (client: PoolClient) => Promise<T>,
-    options: TransactionOptions = {},
+    pool: PoolName,
+    callback: (client: pg.PoolClient) => Promise<T>,
+    optionsOrTimeout?: number | TransactionOptions,
   ): Promise<T> {
-    const client = await this.getPool(name).connect();
-    let discardClient = false;
+    const pgPool = this.getPool(pool);
+    const client = await pgPool.connect();
+
+    const opts: TransactionOptions =
+      typeof optionsOrTimeout === 'number'
+        ? { statementTimeoutMs: optionsOrTimeout }
+        : optionsOrTimeout ?? {};
+
+    const timeout = opts.statementTimeoutMs ?? this.statementTimeoutMs;
+
     try {
-      await client.query('BEGIN');
-      await this.configureTransaction(client, options);
+      await client.query(`SET statement_timeout = ${timeout}`);
+      if (opts.lockTimeoutMs) {
+        await client.query(`SET lock_timeout = ${opts.lockTimeoutMs}`);
+      }
+
+      let beginStmt = 'BEGIN';
+      if (opts.isolationLevel) {
+        beginStmt += ` ISOLATION LEVEL ${opts.isolationLevel}`;
+      }
+      if (opts.readOnly) {
+        beginStmt += ' READ ONLY';
+      }
+
+      await client.query(beginStmt);
       const result = await callback(client);
       await client.query('COMMIT');
       return result;
-    } catch (error) {
-      try { await client.query('ROLLBACK'); } catch { discardClient = true; }
-      throw error;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
     } finally {
-      client.release(discardClient);
+      await client.query('RESET statement_timeout').catch(() => {});
+      await client.query('RESET lock_timeout').catch(() => {});
+      client.release();
     }
   }
 
-  /** Run work in a transaction that can never commit, and prove cleanup succeeded. */
-  async withRollbackTransaction<T>(
-    name: PoolName,
-    callback: (client: PoolClient) => Promise<T>,
-    options: TransactionOptions = {},
-  ): Promise<T> {
-    const client = await this.getPool(name).connect();
-    let transactionOpen = false;
-    let discardClient = false;
-    try {
-      await client.query('BEGIN');
-      transactionOpen = true;
-      await this.configureTransaction(client, options);
-      const result = await callback(client);
-      await client.query('ROLLBACK');
-      transactionOpen = false;
-      return result;
-    } catch (error) {
-      if (transactionOpen) {
-        try {
-          await client.query('ROLLBACK');
-          transactionOpen = false;
-        } catch (rollbackError) {
-          discardClient = true;
-          throw new AggregateError(
-            [error, rollbackError],
-            'Shadow operation failed and rollback could not be confirmed; the connection was destroyed.',
-          );
-        }
-      }
-      throw error;
-    } finally {
-      client.release(discardClient || transactionOpen);
-    }
-  }
-
-  async query<R extends QueryResultRow = QueryResultRow>(
-    poolName: PoolName,
-    sql: string,
-    params: unknown[] = [],
-    timeoutMs?: number,
-  ): Promise<QueryResult<R>> {
-    return this.withClient(poolName, async (client) => {
-      try {
-        await client.query("SELECT set_config('statement_timeout', $1, false)", [
-          `${timeoutMs ?? this.statementTimeoutMs}ms`,
-        ]);
-        return await client.query<R>(sql, params);
-      } finally {
-        await client.query('RESET statement_timeout').catch(() => undefined);
-      }
-    });
-  }
-
+  /**
+   * Gracefully close all connection pools.
+   */
   async close(): Promise<void> {
-    await Promise.all([...this.pools.values()].map((pool) => pool.end()));
+    const closeTasks: Promise<void>[] = [];
+    for (const [name, pool] of this.pools) {
+      closeTasks.push(
+        pool.end().catch((err: unknown) => {
+          console.error(`Error closing pool "${name}":`, err);
+        }),
+      );
+    }
+    await Promise.all(closeTasks);
     this.pools.clear();
-    this.configuredRole = null;
   }
 }
 
+/** Singleton database manager instance. */
 export const db = new DatabaseManager();

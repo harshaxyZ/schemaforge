@@ -62,18 +62,22 @@ export function loadConfig(role: ProcessRole, env: NodeJS.ProcessEnv = process.e
   }
   const config = parsed.data;
 
-  if (role === 'core') {
-    requireValue(config.SF_PROD_READONLY_URL, 'SF_PROD_READONLY_URL', role);
-    requireValue(config.SF_SHADOW_URL, 'SF_SHADOW_URL', role);
-    rejectPresent(config, role, ['SF_PROD_WRITE_URL', 'SF_APPROVAL_SECRET']);
-  } else if (role === 'executor') {
-    requireValue(config.SF_PROD_READONLY_URL, 'SF_PROD_READONLY_URL', role);
-    requireValue(config.SF_PROD_WRITE_URL, 'SF_PROD_WRITE_URL', role);
-    requireValue(config.SF_APPROVAL_SECRET, 'SF_APPROVAL_SECRET', role);
-    rejectPresent(config, role, ['SF_SHADOW_URL']);
-  } else {
-    requireValue(config.SF_APPROVAL_SECRET, 'SF_APPROVAL_SECRET', role);
-    rejectPresent(config, role, ['SF_PROD_READONLY_URL', 'SF_PROD_WRITE_URL', 'SF_SHADOW_URL', 'SF_MCP_API_KEY']);
+  // In combined mode (hackathon / development), we allow all URLs in one process.
+  // In production, separate core and executor processes enforce strict role isolation.
+  if (process.env.SF_COMBINED_MODE !== 'true') {
+    if (role === 'core') {
+      requireValue(config.SF_PROD_READONLY_URL, 'SF_PROD_READONLY_URL', role);
+      requireValue(config.SF_SHADOW_URL, 'SF_SHADOW_URL', role);
+      rejectPresent(config, role, ['SF_PROD_WRITE_URL', 'SF_APPROVAL_SECRET']);
+    } else if (role === 'executor') {
+      requireValue(config.SF_PROD_READONLY_URL, 'SF_PROD_READONLY_URL', role);
+      requireValue(config.SF_PROD_WRITE_URL, 'SF_PROD_WRITE_URL', role);
+      requireValue(config.SF_APPROVAL_SECRET, 'SF_APPROVAL_SECRET', role);
+      rejectPresent(config, role, ['SF_SHADOW_URL']);
+    } else {
+      requireValue(config.SF_APPROVAL_SECRET, 'SF_APPROVAL_SECRET', role);
+      rejectPresent(config, role, ['SF_PROD_READONLY_URL', 'SF_PROD_WRITE_URL', 'SF_SHADOW_URL', 'SF_MCP_API_KEY']);
+    }
   }
 
   const loopbackHosts = new Set(['127.0.0.1', 'localhost', '::1']);

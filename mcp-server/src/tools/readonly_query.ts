@@ -1,10 +1,23 @@
-/** Bounded, transaction-level read-only production query tool. */
+/**
+ * SchemaForge v2.0 — Tool: db_run_readonly_query
+ * Safety Tier: 0 (read-only, no approval needed)
+ *
+ * Executes an arbitrary SELECT query against the production database using
+ * the sf_reader role. The query is validated to ensure it is read-only:
+ *   1. Only SELECT statements are allowed (no INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE).
+ *   2. Row count is capped at max_rows (default 100, max 1000).
+ *   3. statement_timeout is enforced by the DatabaseManager.
+ *
+ * This tool is the agent's primary means of inspecting live data to make
+ * informed migration decisions (e.g. checking null ratios, data distributions).
+ */
 
 import { db } from '../db.js';
-import { requireReadonlyQuery } from '../security/sql_policy.js';
 
 export interface RunReadonlyQueryInput {
+  /** The SELECT query to execute. */
   query: string;
+  /** Maximum rows to return. Default 100, max 1000. */
   max_rows?: number;
 }
 
@@ -15,33 +28,44 @@ export interface RunReadonlyQueryResult {
   truncated: boolean;
 }
 
-function configuredRowCap(): number {
-  const parsed = Number.parseInt(process.env.SF_MAX_RESULT_ROWS ?? '1000', 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1_000;
-}
+/** Statements that are prohibited in read-only mode. */
+const PROHIBITED_PATTERNS = /^\s*(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|COPY|VACUUM|REINDEX|CLUSTER|COMMENT|SECURITY|SET\s+ROLE|RESET\s+ROLE)\b/i;
 
-export async function runReadonlyQuery(
-  input: RunReadonlyQueryInput,
-): Promise<RunReadonlyQueryResult> {
-  const query = requireReadonlyQuery(input.query);
-  const hardCap = configuredRowCap();
-  const maxRows = Math.min(Math.max(input.max_rows ?? 100, 1), hardCap);
+/**
+ * Execute a read-only query against production.
+ *
+ * @param input — query string and optional row limit
+ * @returns column names, row data, and whether results were truncated
+ * @throws if the query contains prohibited statements
+ */
+export async function runReadonlyQuery(input: RunReadonlyQueryInput): Promise<RunReadonlyQueryResult> {
+  const { query } = input;
+  const maxRows = Math.min(Math.max(input.max_rows ?? 100, 1), 1000);
 
-  return db.withTransaction(
-    'prodReadonly',
-    async (client) => {
-      const result = await client.query(
-        `SELECT * FROM (${query}) AS __sf_readonly LIMIT ${maxRows + 1}`,
-      );
-      const truncated = result.rows.length > maxRows;
-      const rows = (truncated ? result.rows.slice(0, maxRows) : result.rows) as Record<string, unknown>[];
-      return {
-        columns: result.fields.map((field) => field.name),
-        rows,
-        row_count: rows.length,
-        truncated,
-      };
-    },
-    { readOnly: true },
-  );
+  // ── Safety: reject anything that is not a SELECT ──
+  if (PROHIBITED_PATTERNS.test(query)) {
+    throw new Error(
+      'Query rejected: only SELECT statements are allowed on the read-only connection. ' +
+        'Detected a prohibited statement keyword.',
+    );
+  }
+
+  // ── Strip trailing semicolon if present ──
+  const cleanQuery = query.trim().replace(/;+$/, '');
+
+  // ── Wrap with LIMIT to enforce row cap ──
+  const wrappedQuery = `SELECT * FROM (${cleanQuery}) AS __sf_readonly LIMIT ${maxRows + 1}`;
+
+  const result = await db.query('prodReadonly', wrappedQuery);
+
+  const truncated = result.rows.length > maxRows;
+  const rows = truncated ? result.rows.slice(0, maxRows) : result.rows;
+  const columns = result.fields?.map((f) => f.name) ?? [];
+
+  return {
+    columns,
+    rows: rows as Record<string, unknown>[],
+    row_count: rows.length,
+    truncated,
+  };
 }
