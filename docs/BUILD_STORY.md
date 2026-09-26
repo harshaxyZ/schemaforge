@@ -16,7 +16,7 @@ It type-checked. It still didn't deliver what it claimed.
 
 ## What the review exposed
 
-Before building further, we reviewed the code against the playbook and recorded 16 findings in an implementation plan (`plan/SchemaForge_Implementation_Plan.pdf`). Four of them blocked the demo:
+Before building further, we reviewed the code against the playbook and recorded 16 findings in an internal implementation plan. Four of them blocked the demo:
 
 - **F1, config mismatch.** The server read `SF_*` environment variables, but the example env file and agent config used different names. No database pool would ever connect.
 - **F2, transactions that didn't hold together.** Every `db.query()` checked out a fresh pooled connection. `BEGIN`, the migration and `COMMIT` ran in different sessions, so `ROLLBACK` did nothing and a failed migration could be half-applied.

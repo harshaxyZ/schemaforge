@@ -1,0 +1,17 @@
+# Public HTTPS gateway. Caddy obtains a certificate for SF_DOMAIN automatically.
+# Only the two MCP services are exposed; the databases stay on internal networks.
+{$SF_DOMAIN} {
+	encode gzip
+
+	handle_path /core/* {
+		reverse_proxy core:3100
+	}
+
+	handle_path /executor/* {
+		reverse_proxy executor:3101
+	}
+
+	handle {
+		respond "SchemaForge MCP gateway. Endpoints: /core/mcp, /executor/mcp" 200
+	}
+}
