@@ -1,91 +1,67 @@
-###############################################################################
-# SchemaForge v2.0 — TrueForge Agent Configuration
-# Autonomous Database Migration Reliability Agent
-# TrueFoundry × Polaris "Agents That Act" Hackathon
-###############################################################################
+# SchemaForge TrueForge UI/API setup worksheet (not directly importable).
+# Configure two remote MCP connectors, paste the complete system-prompt.md into
+# the agent Instructions field, then mirror the remaining fields below.
 
-agent:
-  name: SchemaForge
-  version: "2.0"
-  description: "Autonomous Database Migration Reliability Agent"
-
-# ---------------------------------------------------------------------------
-# Model configuration
-# ---------------------------------------------------------------------------
 model:
-  provider: "openai"  # or anthropic/google
-  model: "${LLM_MODEL}"
-  temperature: 0.1  # Low temperature for deterministic reasoning
-  max_tokens: 4096
+  name: openai/gpt-5.2
+  params:
+    temperature: 0.1
+    max_tokens: 8192
+    parallel_tool_calls: false
+    reasoning_effort: high
 
-# ---------------------------------------------------------------------------
-# MCP server — bridges the agent to PostgreSQL via typed tool calls
-# ---------------------------------------------------------------------------
-mcp:
-  server:
-    command: "node"
-    args: ["mcp-server/dist/index.js"]
-    env:
-      PROD_DATABASE_URL: "${PROD_DATABASE_URL}"
-      PROD_READONLY_URL: "${PROD_READONLY_URL}"
-      SHADOW_DATABASE_URL: "${SHADOW_DATABASE_URL}"
+instructions: |
+  You are SchemaForge, an evidence-driven PostgreSQL migration reliability
+  agent. For every request: clarify intent, inspect production, analyze
+  dependencies, synthesize fingerprint-covered transactional schema DDL,
+  rehearse it with explicit assertions and rollback in the shadow database,
+  assess risk, present a complete decision packet, and freeze. Enter execution
+  only on a new human message carrying a signed token for the unchanged SQL and
+  assertions. Never invent measurements, mint approvals, issue DML, or override
+  DO_NOT_APPLY. Stop on drift, failed assertions, or fingerprint mismatch.
 
-# ---------------------------------------------------------------------------
-# Safety tiers — every tool and operation is classified
-# ---------------------------------------------------------------------------
-safety:
-  tiers:
-    # Tier 0 — read-only, no mutation risk
-    - tier: 0
-      label: "Safe autonomous"
-      tools:
-        - "db_inspect_schema"
-        - "db_run_readonly_query"
-        - "analyze_dependencies"
-        - "verify_production"
-      requires_approval: false
+mcp_servers:
+  - name: schemaforge-core
+    enable_tools:
+      - db_inspect_schema
+      - db_run_readonly_query
+      - analyze_dependencies
+      - rehearse_migration
+      - verify_production
+    preload_tools:
+      - db_inspect_schema
+      - rehearse_migration
+    require_approval_for_tools: []
+    preload: false
 
-    # Tier 1 — sandbox-only mutations, locally reversible
-    - tier: 1
-      label: "Local / reversible"
-      tools:
-        - "rehearse_migration"
-      requires_approval: false
-      audit: true
+  - name: schemaforge-executor
+    enable_tools:
+      - execute_migration
+    preload_tools:
+      - execute_migration
+    # Literal naming is deliberate even though the MCP tool also publishes
+    # destructiveHint: true. Either mechanism preserves the human pause.
+    require_approval_for_tools:
+      - "@destructive"
+      - execute_migration
+    preload: true
 
-    # Tier 2 — production mutation, requires explicit human approval
-    - tier: 2
-      label: "Consequential"
-      tools:
-        - "execute_migration"
-      requires_approval: true
-      approval_mode: "action_bound"
+config:
+  sandbox:
+    enabled: true
+    file_downloads: true
+  ask_user_questions:
+    enabled: true
+  dynamic_sub_agents:
+    enabled: false
+  generative_ui:
+    enabled: true
+  context_management:
+    compaction:
+      enabled: true
+    large_tool_response:
+      enabled: true
+  iteration_limit: 80
 
-    # Tier 3 — unconditionally rejected, no approval path exists
-    - tier: 3
-      label: "Prohibited"
-      operations:
-        - "DROP TABLE"
-        - "TRUNCATE"
-        - "DROP DATABASE"
-        - "ALTER ROLE"
-        - "GRANT"
-        - "REVOKE"
-      action: "reject"
-
-# ---------------------------------------------------------------------------
-# Lifecycle limits
-# ---------------------------------------------------------------------------
-lifecycle:
-  max_tool_calls: 50
-  session_timeout_minutes: 30
-  preserve_state_on_gate: true
-
-# ---------------------------------------------------------------------------
-# Approval gate — action-bound, single-use, fingerprint-verified
-# ---------------------------------------------------------------------------
-approval:
-  token_expiry_seconds: 300
-  single_use: true
-  require_schema_fingerprint_match: true
-  default_decision: "reject"  # No pre-selected approval
+response_format:
+  type: text

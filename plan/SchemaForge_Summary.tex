@@ -1,139 +1,167 @@
-% SchemaForge v2.0 --- Two-page executive summary
+% SchemaForge --- Two-page project summary
 % Compile: tectonic SchemaForge_Summary.tex
-\documentclass[11pt,a4paper]{article}
+\documentclass[10pt,a4paper]{article}
 
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
-\usepackage[margin=2.4cm]{geometry}
+\usepackage[margin=2.0cm]{geometry}
 \usepackage{booktabs}
 \usepackage{enumitem}
 \usepackage{xcolor}
-\usepackage[colorlinks=true,linkcolor=black,urlcolor=black]{hyperref}
 \usepackage{titlesec}
+\usepackage{tabularx}
+\usepackage[colorlinks=true,linkcolor=black,urlcolor=sfnavy]{hyperref}
 
 \definecolor{sfnavy}{HTML}{16324F}
 \definecolor{sfrule}{HTML}{B8C4D0}
+\definecolor{sfbox}{HTML}{F2F5F8}
 
 \titleformat{\section}{\normalfont\large\bfseries\color{sfnavy}}{}{0pt}{}
-\titlespacing*{\section}{0pt}{1.4ex plus .2ex}{0.7ex}
+\titlespacing*{\section}{0pt}{1.5ex plus .2ex}{0.6ex}
 
-\setlist[itemize]{leftmargin=1.3em,itemsep=0.25ex,topsep=0.4ex}
-\renewcommand{\arraystretch}{1.15}
+\setlist[itemize]{leftmargin=1.3em,itemsep=0.2ex,topsep=0.3ex}
+\setlist[enumerate]{leftmargin=1.5em,itemsep=0.2ex,topsep=0.3ex}
+\renewcommand{\arraystretch}{1.18}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.6ex}
 \pagestyle{empty}
 
 \begin{document}
 
 \begin{center}
-  {\color{sfnavy}\Large\bfseries SchemaForge v2.0 --- Summary}\\[0.4ex]
-  {\small Autonomous Database Migration Reliability Agent}\\[0.2ex]
-  {\footnotesize TrueFoundry $\times$ Polaris ``Agents That Act'' \textperiodcentered\ 26 September 2026}
+  {\color{sfnavy}\LARGE\bfseries SchemaForge}\\[0.5ex]
+  {\normalsize Rehearse PostgreSQL migrations, prove what happened, stop before production}\\[0.4ex]
+  {\footnotesize TrueFoundry $\times$ Polaris ``Agents That Act'' Hackathon \textperiodcentered\ Project Summary \textperiodcentered\ September 2026}
 \end{center}
-\vspace{0.4ex}
+\vspace{0.2ex}
 {\color{sfrule}\hrule height 1pt}
-\vspace{1.6ex}
+\vspace{0.8ex}
+
+\colorbox{sfbox}{\parbox{\dimexpr\linewidth-2\fboxsep}{\centering\itshape
+The model proposes; tools measure; policy constrains; a human decides.}}
 
 \section*{What it is}
-SchemaForge turns a plain-English migration request into an evidence-backed decision. TrueForge
-drives the loop: the agent inspects the live PostgreSQL target, maps dependencies, synthesises
-forward and rollback SQL, rehearses it against a copy of real data, and produces a decision packet.
-Then it stops. Production is only changed after a human signs an approval bound to that exact
-migration.
+SchemaForge is a TrueForge agent that turns a natural-language database change into an
+evidence-backed migration decision. It inspects a live PostgreSQL~16 target, maps the dependency
+blast radius, runs the generated SQL inside a rollback-only shadow sandbox, checks explicit
+assertions and rollback equivalence, and then freezes at a human approval checkpoint. It is not a
+free-running SQL generator: nothing reaches production without a signed approval bound to the exact SQL and
+assertion set, followed by a second Allow/Deny gate in TrueForge.
 
-\section*{The boundary}
-Write credentials never sit in the agent loop. Two MCP servers run with different secrets:
-\textbf{sf-core} holds read-only and shadow access; \textbf{sf-executor} holds the single
-production write role and the approval key. A separate terminal tool signs approvals. The
-executor re-checks the signature, the SQL hash, the schema fingerprint, and a single-use
-ledger before it applies anything. Forged, edited, expired, replayed, or stale approvals are
-each rejected with their own code.
+\section*{Architecture}
+Two role-separated Streamable HTTP MCP servers, written in TypeScript, are attached to one TrueForge agent.
 
-\section*{Plan}
-\begin{table}[h]
-\centering
-\begin{tabular}{@{}llp{7.2cm}@{}}
+\begin{tabularx}{\linewidth}{@{}p{3.9cm}X@{}}
 \toprule
-\textbf{Phase} & \textbf{Time} & \textbf{Outcome} \\
+\textbf{Component} & \textbf{Responsibility and credentials} \\
 \midrule
-0 Unblock          & 1.5 h & Config, transactions and demo data actually work \\
-1 Safety core      & 2.0 h & SQL classifier, signed approvals, executor split \\
-2 Rehearsal        & 1.5 h & Disposable shadow copies, deterministic verdicts \\
-3 Agent            & 1.0 h & TrueForge gate, prompt, approval CLI \\
-4 Tests            & 1.0 h & Twelve tests, one per safety claim \\
-5 Demo             & 0.5 h & Two dry runs, reset script, backup video \\
-\midrule
-\textbf{Total}     & \textbf{7.5 h} & \\
+\texttt{schemaforge-core} :3100 & Schema inspection, bounded read-only queries, dependency analysis, shadow
+rehearsal, post-apply verification. Holds only the \texttt{sf\_reader} (production, read-only) and
+\texttt{sf\_shadow} credentials. \\
+\texttt{schemaforge-executor} :3101 & Exposes a single tool, \texttt{execute\_migration}, marked
+\texttt{destructiveHint: true}. Holds the \texttt{sf\_executor} write role (not a superuser) and the
+approval-verification secret; has no shadow access. \\
+Approval CLI & \texttt{npm run approve} runs in the human's terminal and mints a short-lived
+HMAC-SHA256 token. The signing key never enters the agent loop. \\
+PostgreSQL :5433 / :5434 & Production and shadow databases in Docker Compose, both seeded with the
+same deterministic data (500 users, 14 NULL emails, a duplicate-email group, FK and precision edge cases). \\
 \bottomrule
-\end{tabular}
-\end{table}
+\end{tabularx}
 
-\section*{Demo}
-Two requests, five minutes. Making \texttt{users.email} \texttt{NOT NULL} finds fourteen null
-rows in rehearsal and returns \textbf{DO NOT APPLY} with production untouched. Adding a nullable
-\texttt{archived\_at} column passes every check, freezes at the gate, and applies only after the
-human types the migration hash. Post-apply verification confirms the result. The refusal matters
-as much as the success.
+The credential split is structural, not a prompt promise: configuration validation fails fast if the
+core process is given the write URL or approval secret.
 
-\section*{Done when}
-\begin{itemize}
-  \item Both scenarios run live against real PostgreSQL, no hand-written SQL.
-  \item The refusal is produced by rule code, not by model opinion.
-  \item Every rejection path has a passing automated test.
-  \item A stranger can clone the repository and reproduce the run.
-\end{itemize}
+\section*{MCP tools}
+\begin{tabularx}{\linewidth}{@{}llX@{}}
+\toprule
+\textbf{Tool} & \textbf{Annotation} & \textbf{Purpose} \\
+\midrule
+\texttt{db\_inspect\_schema}      & read-only   & Catalog snapshot and stable schema fingerprint \\
+\texttt{db\_run\_readonly\_query} & read-only   & Bounded \texttt{SELECT} / read-only CTE via \texttt{sf\_reader} \\
+\texttt{analyze\_dependencies}    & read-only   & Foreign keys, views, functions/triggers, indexes affected \\
+\texttt{rehearse\_migration}      & write, non-destructive & Rollback-only shadow execution with observed evidence \\
+\texttt{verify\_production}       & read-only   & Expected fingerprint plus explicit postcondition assertions \\
+\texttt{execute\_migration}       & \textbf{destructive} & Signed one-shot apply with exact SQL/assertions and pre-commit postconditions \\
+\bottomrule
+\end{tabularx}
+
+\section*{End-to-end flow}
+\begin{enumerate}
+  \item The human states an objective; the agent inspects schema, data and dependencies (read-only).
+  \item The agent proposes forward SQL, rollback SQL and typed assertions; the SQL policy classifies them.
+  \item \texttt{rehearse\_migration} runs everything on one shadow session and returns a verdict and fingerprints.
+  \item The agent publishes a frozen decision packet and stops.
+  \item A human mints a token bound to exact SQL, assertions, fingerprints and rehearsal ID (five-minute TTL).
+  \item TrueForge pauses the destructive call on an Allow/Deny card; the executor re-verifies, runs the approved assertions and applies atomically.
+\end{enumerate}
 
 \clearpage
 
-\section*{Where it stops}
-Six ways a production apply is refused. Each has its own rejection code and its own test.
-
-\begin{table}[h]
-\centering
-\begin{tabular}{@{}llp{6.6cm}@{}}
-\toprule
-\textbf{Attempt} & \textbf{Code} & \textbf{Caught by} \\
-\midrule
-Token signed with the wrong key & \texttt{BAD\_SIGNATURE}  & HMAC verify in the executor \\
-SQL edited after approval       & \texttt{HASH\_MISMATCH}  & Recomputed hash of the SQL \\
-Approval reused                 & \texttt{REPLAYED}        & Single-use ledger in the database \\
-Approval too old                & \texttt{EXPIRED}         & Short time-to-live on the payload \\
-Schema changed since rehearsal  & \texttt{SCHEMA\_DRIFT}   & Fingerprint recaptured before apply \\
-Prohibited statement            & \texttt{PROHIBITED}      & Parser, plus a restricted write role \\
-\bottomrule
-\end{tabular}
-\end{table}
+\section*{Safety properties}
+\begin{itemize}
+  \item \textbf{Fail-closed SQL policy.} Tier-3 operations, DML, procedural escape hatches, internal-ledger
+  access, ambiguous escapes, unknown statements and mixed or non-transactional plans are rejected in code.
+  \item \textbf{Deterministic sandbox.} Forward SQL, assertions, lock observation, fingerprints and rollback run on one
+  shadow connection; an outer \texttt{ROLLBACK} always runs, even on success.
+  \item \textbf{Assertions, not vibes.} Each check declares an expected outcome (\texttt{first\_value\_true},
+  \texttt{scalar\_equals}, \texttt{returns\_rows}, \texttt{returns\_no\_rows}); returning without error never passes.
+  \item \textbf{Rollback equivalence.} Rollback SQL runs under a savepoint and must restore the exact baseline fingerprint.
+  \item \textbf{Exact-action approval.} The HMAC covers SQL and assertion-set hashes, baseline and expected fingerprints,
+  rehearsal ID, action, target, nonce, issue time, expiry and single-use intent.
+  \item \textbf{Replay, drift and postcondition checks.} The nonce is claimed atomically in a production ledger; the
+  apply aborts on baseline drift, then rolls back unless both the post-fingerprint and all approved assertions pass.
+  Applies are serialized with an advisory lock under statement and lock timeouts.
+\end{itemize}
 
 \section*{How the verdict is decided}
-Fixed rules, first match wins. The model explains the verdict; it cannot change it.
+Computed by code in \texttt{rehearse\_migration}; the model explains the verdict but cannot change it.
 
-\begin{table}[h]
-\centering
-\begin{tabular}{@{}lp{4.1cm}@{}}
+\begin{tabularx}{\linewidth}{@{}Xl@{}}
 \toprule
 \textbf{Evidence} & \textbf{Verdict} \\
 \midrule
-Prohibited or unparseable statement      & DO NOT APPLY \\
-Rehearsal failed, or violations found    & DO NOT APPLY \\
-Invariant check failed after migration   & DO NOT APPLY \\
-Schema drifted, or rollback unproven     & REVIEW \\
-Application references flagged           & REVIEW \\
-Everything green                         & APPLY \\
+Policy rejects the SQL (prohibited, unsupported, non-transactional) & rejected before rehearsal \\
+Forward SQL fails, or any assertion fails                           & \texttt{DO\_NOT\_APPLY} \\
+Rollback supplied but does not restore the baseline fingerprint     & \texttt{DO\_NOT\_APPLY} \\
+No rollback supplied, or the plan is classified destructive         & \texttt{REVIEW} \\
+Rehearsal, assertions and rollback all verified                     & \texttt{APPLY} \\
 \bottomrule
-\end{tabular}
-\end{table}
+\end{tabularx}
 
-\section*{Stack}
-TrueForge harness, two MCP servers in TypeScript, PostgreSQL 16 in Docker Compose, a terminal
-approval tool. No mocked responses: the databases, roles, rehearsal and migration are real.
+\section*{Where production apply is refused}
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+\textbf{Code} & \textbf{Cause} \\
+\midrule
+\texttt{TOKEN\_MALFORMED} / \texttt{SIGNATURE\_INVALID} & Token unparseable or signed with the wrong key \\
+\texttt{HASH\_MISMATCH} / \texttt{ASSERTIONS\_MISMATCH} / \texttt{TARGET\_MISMATCH} & SQL or assertions edited after approval, or wrong target \\
+\texttt{TOKEN\_EXPIRED} / \texttt{TOKEN\_NOT\_YET\_VALID} / \texttt{TTL\_EXCEEDED} & Outside the validity window or TTL too long \\
+\texttt{REPLAY\_DETECTED}      & Nonce already claimed in the ledger \\
+\texttt{SCHEMA\_DRIFT}         & Production no longer matches the rehearsed baseline \\
+\texttt{POSTCONDITION\_FAILED} & Post-apply fingerprint differs; transaction rolled back \\
+\texttt{SQL\_POLICY\_REJECTED} & Statement fails the policy re-check in the executor \\
+\bottomrule
+\end{tabularx}
 
-\section*{Not building}
-Multi-database support, Kubernetes, chat integrations, a login system, a web UI, multi-agent
-orchestration, or automatic rollback of changes that cannot be reversed.
+\section*{Demo scenarios}
+\textbf{A --- knowing when to stop.} ``Make \texttt{users.email} \texttt{NOT NULL} and \texttt{UNIQUE}.''
+The agent observes 14 NULLs and a duplicate group; the naive migration fails rehearsal, the verdict is
+\texttt{DO\_NOT\_APPLY}, and no production tool is called.
+
+\textbf{B --- safe action behind two gates.} ``Add an optional \texttt{phone VARCHAR(32)} column.''
+Rehearsal passes, rollback (\texttt{DROP COLUMN phone}) restores the baseline, and an
+\texttt{information\_schema} assertion confirms the column. The human mints a token, TrueForge shows
+Allow/Deny, the executor applies atomically, and reusing the token returns \texttt{REPLAY\_DETECTED}.
+
+\section*{Stack and validation}
+TrueForge 0.2.1 harness, Node.js 22.14+, TypeScript MCP servers, PostgreSQL~16 in Docker Compose,
+Daytona sandbox for helper code. Validate with \texttt{npm run check}, \texttt{npm run build}, \texttt{npm test} and
+\texttt{docker compose config --quiet}. No mocked responses: databases, roles, rehearsal and migration are real.
 
 \vfill
 {\color{sfrule}\hrule height 0.4pt}
-\vspace{0.8ex}
-\noindent{\footnotesize Full detail: \texttt{SchemaForge\_Implementation\_Plan.pdf} --- current-state
-findings, architecture, phase tasks with acceptance criteria, schedule, risk register and file
-change map.}
+\vspace{0.6ex}
+{\footnotesize Repository: \url{https://github.com/harshaxyZ/schemaforge} \textperiodcentered\ MIT licence
+\textperiodcentered\ Built with AI assistance (Kiro IDE); the human team owns product decisions.}
 
 \end{document}

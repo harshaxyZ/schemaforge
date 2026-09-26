@@ -1,0 +1,20 @@
+{
+  "name": "schemaforge",
+  "version": "2.1.0",
+  "private": true,
+  "description": "Evidence-driven PostgreSQL migration agent built on TrueForge",
+  "scripts": {
+    "setup": "npm ci --prefix mcp-server && npm ci --prefix e2e",
+    "build": "npm run build --prefix mcp-server",
+    "check": "npm run check --prefix mcp-server && npm run typecheck --prefix e2e",
+    "test": "npm test --prefix e2e",
+    "test:unit": "npm run test:unit --prefix e2e",
+    "start:core": "npm run start:core --prefix mcp-server",
+    "start:executor": "npm run start:executor --prefix mcp-server",
+    "approve": "npm run approve --prefix mcp-server --"
+  },
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "license": "MIT"
+}

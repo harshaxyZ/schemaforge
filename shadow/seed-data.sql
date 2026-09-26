@@ -1,6 +1,6 @@
 -- ============================================================================
--- SchemaForge v2.0 — Shadow Database Seed Data
--- Deterministic bulk generation using generate_series + random()
+-- SchemaForge v2.1 — Shared Demo Seed Data
+-- Mounted into both production and shadow demo databases.
 -- PostgreSQL 16 compatible
 -- ============================================================================
 

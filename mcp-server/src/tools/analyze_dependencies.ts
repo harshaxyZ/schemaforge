@@ -1,53 +1,58 @@
-/**
- * SchemaForge v2.0 — Tool: analyze_dependencies
- * Safety Tier: 0 (read-only, no approval needed)
- *
- * Analyzes database-level dependencies for a given table (and optionally a
- * specific column). This includes:
- *   - Foreign key relationships (both inbound and outbound)
- *   - Views that reference the table/column
- *   - Functions/triggers that reference the table/column
- *   - Indexes that include the column
- *   - Dependent materialized views
- *
- * The output helps the decision engine determine the blast radius of a
- * proposed schema change and flag application-level references.
- */
+/** Exact PostgreSQL catalog dependency analysis for one public table/column. */
 
 import { db } from '../db.js';
 
 export interface AnalyzeDependenciesInput {
-  /** The table to analyze. */
   table_name: string;
-  /** Optional: restrict analysis to a specific column. */
   column_name?: string;
 }
 
 export interface ForeignKeyDep {
   constraint_name: string;
   source_table: string;
-  source_column: string;
+  source_columns: string[];
   target_table: string;
-  target_column: string;
+  target_columns: string[];
   direction: 'inbound' | 'outbound';
+  definition: string;
 }
 
 export interface ViewDep {
   view_name: string;
+  view_type: 'view' | 'materialized_view';
   view_definition: string;
 }
 
 export interface FunctionDep {
   function_name: string;
-  function_type: 'function' | 'trigger';
+  identity_arguments: string;
   source_snippet: string;
+}
+
+export interface TriggerDep {
+  trigger_name: string;
+  definition: string;
+  function_name: string;
 }
 
 export interface IndexDep {
   index_name: string;
   index_definition: string;
   is_unique: boolean;
+  is_valid: boolean;
   columns: string[];
+}
+
+export interface PolicyDep {
+  policy_name: string;
+  command: string;
+  roles: string[];
+  using_expression: string | null;
+  check_expression: string | null;
+}
+
+export interface SequenceDep {
+  sequence_name: string;
 }
 
 export interface AnalyzeDependenciesResult {
@@ -56,138 +61,191 @@ export interface AnalyzeDependenciesResult {
   foreign_keys: ForeignKeyDep[];
   dependent_views: ViewDep[];
   dependent_functions: FunctionDep[];
+  triggers: TriggerDep[];
   dependent_indexes: IndexDep[];
+  row_level_security_policies: PolicyDep[];
+  owned_sequences: SequenceDep[];
   total_dependencies: number;
 }
 
-/**
- * Analyze all database-level dependencies for a table/column.
- *
- * @param input — table name and optional column filter
- * @returns a comprehensive dependency report
- */
 export async function analyzeDependencies(
   input: AnalyzeDependenciesInput,
 ): Promise<AnalyzeDependenciesResult> {
   const { table_name, column_name } = input;
 
-  // ── Foreign keys (both directions) ──
-  const fkQuery = `
-    SELECT
-      tc.constraint_name,
-      kcu.table_name  AS source_table,
-      kcu.column_name AS source_column,
-      ccu.table_name  AS target_table,
-      ccu.column_name AS target_column,
-      CASE
-        WHEN kcu.table_name = $1 THEN 'outbound'
-        ELSE 'inbound'
-      END AS direction
-    FROM information_schema.table_constraints tc
-    JOIN information_schema.key_column_usage kcu
-      ON tc.constraint_name = kcu.constraint_name
-      AND tc.table_schema = kcu.table_schema
-    JOIN information_schema.constraint_column_usage ccu
-      ON tc.constraint_name = ccu.constraint_name
-      AND tc.table_schema = ccu.table_schema
-    WHERE tc.constraint_type = 'FOREIGN KEY'
-      AND tc.table_schema = 'public'
-      AND (kcu.table_name = $1 OR ccu.table_name = $1)
-    ORDER BY tc.constraint_name
-  `;
-  const fkResult = await db.query('prodReadonly', fkQuery, [table_name]);
+  return db.withTransaction(
+    'prodReadonly',
+    async (client) => {
+      const relation = await client.query<{ oid: string | null }>(
+        `SELECT to_regclass(format('%I.%I', 'public', $1))::oid::text AS oid`,
+        [table_name],
+      );
+      if (!relation.rows[0]?.oid) throw new Error(`public.${table_name} does not exist.`);
 
-  let foreignKeys: ForeignKeyDep[] = fkResult.rows.map((r) => ({
-    constraint_name: r.constraint_name as string,
-    source_table: r.source_table as string,
-    source_column: r.source_column as string,
-    target_table: r.target_table as string,
-    target_column: r.target_column as string,
-    direction: r.direction as 'inbound' | 'outbound',
-  }));
+      const fkResult = await client.query<{
+        constraint_name: string;
+        source_table: string;
+        source_columns: string[];
+        target_table: string;
+        target_columns: string[];
+        direction: 'inbound' | 'outbound';
+        definition: string;
+      }>(
+        `SELECT con.conname AS constraint_name,
+                con.conrelid::regclass::text AS source_table,
+                ARRAY(
+                  SELECT a.attname FROM unnest(con.conkey) WITH ORDINALITY key(attnum, ord)
+                  JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = key.attnum
+                  ORDER BY key.ord
+                ) AS source_columns,
+                con.confrelid::regclass::text AS target_table,
+                ARRAY(
+                  SELECT a.attname FROM unnest(con.confkey) WITH ORDINALITY key(attnum, ord)
+                  JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = key.attnum
+                  ORDER BY key.ord
+                ) AS target_columns,
+                CASE WHEN con.conrelid = to_regclass(format('%I.%I', 'public', $1))
+                     THEN 'outbound' ELSE 'inbound' END AS direction,
+                pg_get_constraintdef(con.oid, true) AS definition
+           FROM pg_constraint con
+          WHERE con.contype = 'f'
+            AND (con.conrelid = to_regclass(format('%I.%I', 'public', $1))
+              OR con.confrelid = to_regclass(format('%I.%I', 'public', $1)))
+          ORDER BY con.conname`,
+        [table_name],
+      );
+      const foreignKeys = fkResult.rows.filter((fk) =>
+        !column_name || fk.source_columns.includes(column_name) || fk.target_columns.includes(column_name),
+      );
 
-  // Filter to specific column if provided
-  if (column_name) {
-    foreignKeys = foreignKeys.filter(
-      (fk) => fk.source_column === column_name || fk.target_column === column_name,
-    );
-  }
+      const viewsResult = await client.query<{
+        view_name: string;
+        view_type: 'view' | 'materialized_view';
+        view_definition: string;
+      }>(
+        `SELECT DISTINCT view_ns.nspname || '.' || view_class.relname AS view_name,
+                CASE view_class.relkind WHEN 'm' THEN 'materialized_view' ELSE 'view' END AS view_type,
+                pg_get_viewdef(view_class.oid, true) AS view_definition
+           FROM pg_depend dep
+           JOIN pg_rewrite rewrite ON rewrite.oid = dep.objid
+           JOIN pg_class view_class ON view_class.oid = rewrite.ev_class
+           JOIN pg_namespace view_ns ON view_ns.oid = view_class.relnamespace
+          WHERE dep.refobjid = to_regclass(format('%I.%I', 'public', $1))
+            AND view_class.relkind IN ('v', 'm')
+          ORDER BY view_name`,
+        [table_name],
+      );
 
-  // ── Dependent views ──
-  const viewsQuery = `
-    SELECT v.table_name AS view_name,
-           v.view_definition
-    FROM information_schema.views v
-    WHERE v.table_schema = 'public'
-      AND v.view_definition ILIKE $1
-    ORDER BY v.table_name
-  `;
-  const viewPattern = column_name ? `%${table_name}%${column_name}%` : `%${table_name}%`;
-  const viewsResult = await db.query('prodReadonly', viewsQuery, [viewPattern]);
+      const functionsResult = await client.query<{
+        function_name: string;
+        identity_arguments: string;
+        source_snippet: string;
+      }>(
+        `SELECT DISTINCT ns.nspname || '.' || proc.proname AS function_name,
+                pg_get_function_identity_arguments(proc.oid) AS identity_arguments,
+                LEFT(pg_get_functiondef(proc.oid), 1000) AS source_snippet
+           FROM pg_depend dep
+           JOIN pg_proc proc ON proc.oid = dep.objid
+           JOIN pg_namespace ns ON ns.oid = proc.pronamespace
+          WHERE dep.refobjid = to_regclass(format('%I.%I', 'public', $1))
+            AND proc.prokind IN ('f', 'p')
+          ORDER BY function_name`,
+        [table_name],
+      );
 
-  const dependentViews: ViewDep[] = viewsResult.rows.map((r) => ({
-    view_name: r.view_name as string,
-    view_definition: r.view_definition as string,
-  }));
+      const triggersResult = await client.query<{
+        trigger_name: string;
+        definition: string;
+        function_name: string;
+      }>(
+        `SELECT trigger.tgname AS trigger_name,
+                pg_get_triggerdef(trigger.oid, true) AS definition,
+                proc.proname AS function_name
+           FROM pg_trigger trigger
+           JOIN pg_proc proc ON proc.oid = trigger.tgfoid
+          WHERE trigger.tgrelid = to_regclass(format('%I.%I', 'public', $1))
+            AND NOT trigger.tgisinternal
+          ORDER BY trigger.tgname`,
+        [table_name],
+      );
 
-  // ── Dependent functions and triggers ──
-  const funcsQuery = `
-    SELECT p.proname AS function_name,
-           CASE WHEN t.tgname IS NOT NULL THEN 'trigger' ELSE 'function' END AS function_type,
-           LEFT(pg_get_functiondef(p.oid), 500) AS source_snippet
-    FROM pg_proc p
-    JOIN pg_namespace n ON p.pronamespace = n.oid
-    LEFT JOIN pg_trigger t ON t.tgfoid = p.oid
-    WHERE n.nspname = 'public'
-      AND pg_get_functiondef(p.oid) ILIKE $1
-    ORDER BY p.proname
-  `;
-  const funcPattern = column_name ? `%${table_name}%${column_name}%` : `%${table_name}%`;
-  const funcsResult = await db.query('prodReadonly', funcsQuery, [funcPattern]);
+      const indexesResult = await client.query<{
+        index_name: string;
+        index_definition: string;
+        is_unique: boolean;
+        is_valid: boolean;
+        columns: string[];
+      }>(
+        `SELECT index_class.relname AS index_name,
+                pg_get_indexdef(index_class.oid) AS index_definition,
+                idx.indisunique AS is_unique,
+                idx.indisvalid AS is_valid,
+                ARRAY(
+                  SELECT pg_get_indexdef(index_class.oid, key_position, true)
+                  FROM generate_series(1, idx.indnkeyatts) key_position
+                  ORDER BY key_position
+                ) AS columns
+           FROM pg_index idx
+           JOIN pg_class index_class ON index_class.oid = idx.indexrelid
+          WHERE idx.indrelid = to_regclass(format('%I.%I', 'public', $1))
+          ORDER BY index_class.relname`,
+        [table_name],
+      );
+      const indexes = indexesResult.rows.filter((index) =>
+        !column_name || index.columns.some((column) => column.replaceAll('"', '') === column_name),
+      );
 
-  const dependentFunctions: FunctionDep[] = funcsResult.rows.map((r) => ({
-    function_name: r.function_name as string,
-    function_type: r.function_type as 'function' | 'trigger',
-    source_snippet: r.source_snippet as string,
-  }));
+      const policiesResult = await client.query<{
+        policy_name: string;
+        command: string;
+        roles: string[];
+        using_expression: string | null;
+        check_expression: string | null;
+      }>(
+        `SELECT pol.polname AS policy_name,
+                pol.polcmd::text AS command,
+                ARRAY(SELECT rolname FROM pg_roles WHERE oid = ANY(pol.polroles) ORDER BY rolname) AS roles,
+                pg_get_expr(pol.polqual, pol.polrelid) AS using_expression,
+                pg_get_expr(pol.polwithcheck, pol.polrelid) AS check_expression
+           FROM pg_policy pol
+          WHERE pol.polrelid = to_regclass(format('%I.%I', 'public', $1))
+          ORDER BY pol.polname`,
+        [table_name],
+      );
 
-  // ── Dependent indexes ──
-  const indexQuery = `
-    SELECT indexname  AS index_name,
-           indexdef   AS index_definition,
-           (indexdef ILIKE '%UNIQUE%') AS is_unique
-    FROM pg_indexes
-    WHERE schemaname = 'public'
-      AND tablename = $1
-      ${column_name ? `AND indexdef ILIKE $2` : ''}
-    ORDER BY indexname
-  `;
-  const indexParams: string[] = [table_name];
-  if (column_name) {
-    indexParams.push(`%${column_name}%`);
-  }
-  const indexResult = await db.query('prodReadonly', indexQuery, indexParams);
+      const sequencesResult = await client.query<{ sequence_name: string }>(
+        `SELECT seq_ns.nspname || '.' || seq.relname AS sequence_name
+           FROM pg_depend dep
+           JOIN pg_class seq ON seq.oid = dep.objid AND seq.relkind = 'S'
+           JOIN pg_namespace seq_ns ON seq_ns.oid = seq.relnamespace
+          WHERE dep.refobjid = to_regclass(format('%I.%I', 'public', $1))
+            AND dep.deptype IN ('a', 'i')
+          ORDER BY sequence_name`,
+        [table_name],
+      );
 
-  const dependentIndexes: IndexDep[] = indexResult.rows.map((r) => ({
-    index_name: r.index_name as string,
-    index_definition: r.index_definition as string,
-    is_unique: Boolean(r.is_unique),
-    columns: [], // populated from index_definition parsing in future iteration
-  }));
+      const total =
+        foreignKeys.length +
+        viewsResult.rows.length +
+        functionsResult.rows.length +
+        triggersResult.rows.length +
+        indexes.length +
+        policiesResult.rows.length +
+        sequencesResult.rows.length;
 
-  const totalDependencies =
-    foreignKeys.length +
-    dependentViews.length +
-    dependentFunctions.length +
-    dependentIndexes.length;
-
-  return {
-    table_name,
-    column_name: column_name ?? null,
-    foreign_keys: foreignKeys,
-    dependent_views: dependentViews,
-    dependent_functions: dependentFunctions,
-    dependent_indexes: dependentIndexes,
-    total_dependencies: totalDependencies,
-  };
+      return {
+        table_name,
+        column_name: column_name ?? null,
+        foreign_keys: foreignKeys,
+        dependent_views: viewsResult.rows,
+        dependent_functions: functionsResult.rows,
+        triggers: triggersResult.rows,
+        dependent_indexes: indexes,
+        row_level_security_policies: policiesResult.rows,
+        owned_sequences: sequencesResult.rows,
+        total_dependencies: total,
+      };
+    },
+    { readOnly: true, isolationLevel: 'REPEATABLE READ' },
+  );
 }

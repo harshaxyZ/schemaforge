@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typecheck-build:
+    name: Typecheck and build (mcp-server)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: mcp-server
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: mcp-server/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build
+
+  secrets-scan:
+    name: Secrets scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Token is read-only (contents: read), so PR comments are disabled.
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+  # hashFiles() is not available in job-level `if`, so detect the e2e suite first.
+  detect-e2e:
+    name: Detect e2e suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      present: ${{ steps.check.outputs.present }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: check
+        run: echo "present=${{ hashFiles('e2e/package.json') != '' }}" >> "$GITHUB_OUTPUT"
+
+  e2e:
+    name: End-to-end tests
+    needs: detect-e2e
+    if: needs.detect-e2e.outputs.present == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Mirrors docker-compose.yml. Test-only credentials for ephemeral CI containers.
+    services:
+      schemaforge-prod:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: schemaforge_prod
+          POSTGRES_USER: sf_admin
+          POSTGRES_PASSWORD: sf_admin_pass
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U sf_admin -d schemaforge_prod"
+          --health-interval 3s --health-timeout 3s --health-retries 20
+      schemaforge-shadow:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: schemaforge_shadow
+          POSTGRES_USER: sf_shadow
+          POSTGRES_PASSWORD: sf_shadow_pass
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U sf_shadow -d schemaforge_shadow"
+          --health-interval 3s --health-timeout 3s --health-retries 20
+    env:
+      SF_PROD_READONLY_URL: postgresql://sf_reader:sf_reader_pass@127.0.0.1:5433/schemaforge_prod
+      SF_PROD_WRITE_URL: postgresql://sf_executor:sf_executor_pass@127.0.0.1:5433/schemaforge_prod
+      SF_SHADOW_URL: postgresql://sf_shadow:sf_shadow_pass@127.0.0.1:5434/schemaforge_shadow
+      SF_HTTP_HOST: 127.0.0.1
+      SF_E2E_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: |
+            mcp-server/package-lock.json
+            e2e/package-lock.json
+      # Service containers start before checkout, so the compose volume mounts of
+      # docker-entrypoint-initdb.d scripts are replayed here in the same order.
+      - name: Initialise databases
+        env:
+          PROD_ADMIN_URL: postgresql://sf_admin:sf_admin_pass@127.0.0.1:5433/schemaforge_prod
+        run: |
+          for f in docker/init-prod.sql shadow/seed-data.sql shadow/seed-edge-cases.sql; do
+            psql "$PROD_ADMIN_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+          for f in docker/init-shadow.sql shadow/seed-data.sql shadow/seed-edge-cases.sql; do
+            psql "$SF_SHADOW_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+      - name: Generate approval secret
+        run: |
+          secret="$(openssl rand -hex 32)"
+          echo "::add-mask::$secret"
+          echo "SF_APPROVAL_SECRET=$secret" >> "$GITHUB_ENV"
+      - run: npm ci
+        working-directory: mcp-server
+      - run: npm ci
+        working-directory: e2e
+      - run: npm test
+        working-directory: e2e
+
+  latex:
+    name: Compile plan PDFs (optional)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: xu-cheng/latex-action@6549dc21effb2730855a1281407ecfcececc6c1b # v4
+        with:
+          working_directory: plan
+          root_file: "*.tex"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: plan-pdfs
+          path: plan/*.pdf
+          if-no-files-found: warn

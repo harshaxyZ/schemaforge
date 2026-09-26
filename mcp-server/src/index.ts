@@ -1,293 +1,284 @@
-/**
- * SchemaForge v2.0 — MCP Server Entry Point.
- *
- * Registers all 6 database migration tools with the Model Context Protocol
- * server and starts listening on stdio transport.
- *
- * Tool registry:
- *   Tier 0 (read-only):
- *     • db_inspect_schema      — Inspect database schema with fingerprinting
- *     • db_run_readonly_query  — Execute read-only SELECT queries
- *     • analyze_dependencies   — Analyze table/column dependency graph
- *     • verify_production      — Post-migration verification
- *
- *   Tier 1 (shadow-only):
- *     • rehearse_migration     — Rehearse migration on shadow database
- *
- *   Tier 2 (GATED — requires ApprovalToken):
- *     • execute_migration      — Apply migration to production
- */
+#!/usr/bin/env node
+/** Role-separated Streamable HTTP MCP entry point for TrueForge. */
 
+import crypto from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { createMcpExpressApp } from '@modelcontextprotocol/sdk/server/express.js';
 import { z } from 'zod';
-
+import { db } from './db.js';
+import { loadConfig, portForRole, type ProcessRole } from './config.js';
 import { inspectSchema } from './tools/inspect_schema.js';
 import { runReadonlyQuery } from './tools/readonly_query.js';
 import { analyzeDependencies } from './tools/analyze_dependencies.js';
 import { rehearseMigration } from './tools/rehearse_migration.js';
-import { executeMigration } from './tools/execute_migration.js';
 import { verifyProduction } from './tools/verify_production.js';
-import { db } from './db.js';
+import { executeMigration } from './tools/execute_migration.js';
 
-// ─── Server Initialization ─────────────────────────────────────
+const VERSION = '2.1.0';
 
-const server = new McpServer({
-  name: 'schemaforge',
-  version: '2.0.0',
+const readonlyAnnotations = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+} as const;
+
+const assertionBase = {
+  name: z.string().min(1).max(120),
+  query: z.string().min(1),
+};
+const assertionSchema = z.discriminatedUnion('expectation', [
+  z.object({ ...assertionBase, expectation: z.literal('returns_rows') }),
+  z.object({ ...assertionBase, expectation: z.literal('returns_no_rows') }),
+  z.object({ ...assertionBase, expectation: z.literal('first_value_true') }),
+  z.object({
+    ...assertionBase,
+    expectation: z.literal('scalar_equals'),
+    expected_value: z.union([z.string(), z.number(), z.boolean(), z.null()]),
+  }),
+]);
+
+const approvalSchema = z.object({
+  payload: z.object({
+    version: z.literal(1),
+    nonce: z.string().uuid(),
+    migration_hash: z.string().regex(/^[a-f0-9]{64}$/i),
+    assertions_hash: z.string().regex(/^[a-f0-9]{64}$/i),
+    baseline_fingerprint: z.string().regex(/^[a-f0-9]{64}$/i),
+    expected_fingerprint: z.string().regex(/^[a-f0-9]{64}$/i),
+    rehearsal_id: z.string().min(1),
+    target: z.literal('prod'),
+    action: z.string().min(1).max(500),
+    issued_at: z.string().datetime(),
+    expires_at: z.string().datetime(),
+    single_use: z.literal(true),
+  }),
+  signature: z.string().min(1),
 });
 
-// ─── Tool Registration ─────────────────────────────────────────
-
-/**
- * Tier 0 — db_inspect_schema
- * Inspects the production database schema. Returns table definitions,
- * columns, constraints, indexes, and a cryptographic schema fingerprint.
- */
-server.tool(
-  'db_inspect_schema',
-  'Inspect the production database schema. Returns table definitions, columns, constraints, indexes, and a SHA-256 schema fingerprint for drift detection. Optionally filter to a single table.',
-  {
-    table_name: z.string().optional().describe('Optional table name to inspect. Omit for full catalog.'),
-  },
-  async (input) => {
-    try {
-      const result = await inspectSchema({
-        table_name: input.table_name,
-      });
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      };
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return {
-        content: [{ type: 'text' as const, text: `Error: ${msg}` }],
-        isError: true,
-      };
-    }
-  },
-);
-
-/**
- * Tier 0 — db_run_readonly_query
- * Execute a read-only SELECT query against production.
- */
-server.tool(
-  'db_run_readonly_query',
-  'Execute a read-only SELECT query against the production database. Only SELECT statements are allowed. Results are capped at max_rows (default 100, max 1000).',
-  {
-    query: z.string().describe('The SELECT query to execute.'),
-    max_rows: z.number().int().min(1).max(1000).optional()
-      .describe('Maximum number of rows to return. Default 100, max 1000.'),
-  },
-  async (input) => {
-    try {
-      const result = await runReadonlyQuery({
-        query: input.query,
-        max_rows: input.max_rows,
-      });
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      };
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return {
-        content: [{ type: 'text' as const, text: `Error: ${msg}` }],
-        isError: true,
-      };
-    }
-  },
-);
-
-/**
- * Tier 0 — analyze_dependencies
- * Analyze database-level dependencies for a table/column.
- */
-server.tool(
-  'analyze_dependencies',
-  'Analyze database-level dependencies for a table (and optionally a column). Returns foreign keys, dependent views, functions/triggers, and indexes to assess the blast radius of a proposed schema change.',
-  {
-    table_name: z.string().describe('The table to analyze.'),
-    column_name: z.string().optional().describe('Optional column to narrow dependency analysis.'),
-  },
-  async (input) => {
-    try {
-      const result = await analyzeDependencies({
-        table_name: input.table_name,
-        column_name: input.column_name,
-      });
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      };
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return {
-        content: [{ type: 'text' as const, text: `Error: ${msg}` }],
-        isError: true,
-      };
-    }
-  },
-);
-
-/**
- * Tier 1 — rehearse_migration
- * Rehearse a migration on the shadow database (no production impact).
- */
-server.tool(
-  'rehearse_migration',
-  'Rehearse a migration on the disposable shadow database. Executes the forward SQL, runs verification queries, and optionally tests the rollback SQL. Never touches production.',
-  {
-    forward_sql: z.string().describe('The forward migration SQL to rehearse.'),
-    rollback_sql: z.string().optional()
-      .describe('Optional rollback SQL to verify reversibility.'),
-    verification_queries: z.array(z.string())
-      .describe('Queries to run after forward migration to verify expected state.'),
-  },
-  async (input) => {
-    try {
-      const result = await rehearseMigration({
-        forward_sql: input.forward_sql,
-        rollback_sql: input.rollback_sql,
-        verification_queries: input.verification_queries,
-      });
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      };
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return {
-        content: [{ type: 'text' as const, text: `Error: ${msg}` }],
-        isError: true,
-      };
-    }
-  },
-);
-
-/**
- * Tier 2 — execute_migration (GATED)
- * Apply a migration to the production database. Requires a valid ApprovalToken.
- */
-server.tool(
-  'execute_migration',
-  'GATED: Apply a migration to the production database. Requires a valid ApprovalToken with matching SHA-256 hash, valid expiry, and target="prod". This is the ONLY tool that mutates production.',
-  {
-    migration_sql: z.string().describe('The SQL to execute against production.'),
-    approval_token: z.object({
-      migration_hash: z.string().describe('SHA-256 hash of the migration SQL.'),
-      target: z.string().describe('Target database identifier (must be "prod").'),
-      action: z.string().describe('Human-readable action description.'),
-      created_at: z.string().describe('ISO-8601 creation timestamp.'),
-      expires_at: z.string().describe('ISO-8601 expiry timestamp.'),
-      single_use: z.boolean().describe('Whether this token is single-use.'),
-      used: z.boolean().describe('Whether this token has been consumed.'),
-    }).describe('The human-issued approval token authorizing this mutation.'),
-  },
-  async (input) => {
-    try {
-      const result = await executeMigration({
-        migration_sql: input.migration_sql,
-        approval_token: input.approval_token,
-      });
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      };
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return {
-        content: [{ type: 'text' as const, text: `Error: ${msg}` }],
-        isError: true,
-      };
-    }
-  },
-);
-
-/**
- * Tier 0 — verify_production
- * Post-migration verification against production (read-only).
- */
-server.tool(
-  'verify_production',
-  'Post-migration verification. Checks that expected schema/data changes are present in production after a migration. Runs verification queries and smoke tests. Read-only.',
-  {
-    table_name: z.string().describe('The table that was modified.'),
-    expected_changes: z.array(z.string())
-      .describe('Verification queries/assertions to check against production.'),
-  },
-  async (input) => {
-    try {
-      const result = await verifyProduction({
-        table_name: input.table_name,
-        expected_changes: input.expected_changes,
-      });
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      };
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return {
-        content: [{ type: 'text' as const, text: `Error: ${msg}` }],
-        isError: true,
-      };
-    }
-  },
-);
-
-// ─── Server Startup ─────────────────────────────────────────────
-
-async function main(): Promise<void> {
-  const transport = new StdioServerTransport();
-
-  // Graceful shutdown
-  process.on('SIGINT', async () => {
-    console.error('[SchemaForge] Shutting down…');
-    await db.close();
-    await server.close();
-    process.exit(0);
-  });
-
-  process.on('SIGTERM', async () => {
-    console.error('[SchemaForge] Shutting down…');
-    await db.close();
-    await server.close();
-    process.exit(0);
-  });
-
-  console.error('[SchemaForge] MCP Server v2.0.0 starting on stdio transport…');
-  await server.connect(transport);
-  console.error('[SchemaForge] MCP Server v2.0.0 ready. 6 tools registered.');
+function successResult(value: unknown) {
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
+    structuredContent: value as Record<string, unknown>,
+  };
 }
 
-main().catch((err) => {
-  console.error('[SchemaForge] Fatal error:', err);
+function errorResult(error: unknown) {
+  const value = error as { code?: string; message?: string };
+  const payload = {
+    success: false,
+    error: {
+      code: value.code ?? 'TOOL_ERROR',
+      message: error instanceof Error ? error.message : String(error),
+    },
+  };
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify(payload, null, 2) }],
+    structuredContent: payload,
+    isError: true,
+  };
+}
+
+function registerCoreTools(server: McpServer): void {
+  server.registerTool(
+    'db_inspect_schema',
+    {
+      title: 'Inspect production schema',
+      description: 'Read the production PostgreSQL catalog and return stable SHA-256 schema evidence. Estimated row counts are explicitly separate from the fingerprint.',
+      inputSchema: { table_name: z.string().optional() },
+      annotations: readonlyAnnotations,
+    },
+    async (input) => {
+      try { return successResult(await inspectSchema(input)); } catch (error) { return errorResult(error); }
+    },
+  );
+
+  server.registerTool(
+    'db_run_readonly_query',
+    {
+      title: 'Run bounded production read',
+      description: 'Run one bounded SELECT/read-only CTE through the database read-only role and a READ ONLY transaction.',
+      inputSchema: {
+        query: z.string().min(1),
+        max_rows: z.number().int().min(1).max(1_000).optional(),
+      },
+      annotations: readonlyAnnotations,
+    },
+    async (input) => {
+      try { return successResult(await runReadonlyQuery(input)); } catch (error) { return errorResult(error); }
+    },
+  );
+
+  server.registerTool(
+    'analyze_dependencies',
+    {
+      title: 'Analyze migration dependencies',
+      description: 'Map database dependencies for a public table or column before synthesizing migration SQL.',
+      inputSchema: {
+        table_name: z.string().min(1),
+        column_name: z.string().optional(),
+      },
+      annotations: readonlyAnnotations,
+    },
+    async (input) => {
+      try { return successResult(await analyzeDependencies(input)); } catch (error) { return errorResult(error); }
+    },
+  );
+
+  server.registerTool(
+    'rehearse_migration',
+    {
+      title: 'Rehearse migration in shadow sandbox',
+      description: 'Execute generated SQL inside a serialized, rollback-only shadow transaction. Returns measured timing, lock snapshots, fingerprints, row deltas, notices, explicit assertion results, and rollback equivalence.',
+      inputSchema: {
+        forward_sql: z.string().min(1),
+        rollback_sql: z.string().min(1).optional(),
+        verification_assertions: z.array(assertionSchema).min(1).max(20),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async (input) => {
+      try { return successResult(await rehearseMigration(input)); } catch (error) { return errorResult(error); }
+    },
+  );
+
+  server.registerTool(
+    'verify_production',
+    {
+      title: 'Verify production postconditions',
+      description: 'Read-only comparison of the current production schema against a rehearsed fingerprint plus explicit data assertions.',
+      inputSchema: {
+        expected_fingerprint: z.string().regex(/^[a-f0-9]{64}$/i),
+        verification_assertions: z.array(assertionSchema).min(1).max(20),
+      },
+      annotations: readonlyAnnotations,
+    },
+    async (input) => {
+      try { return successResult(await verifyProduction(input)); } catch (error) { return errorResult(error); }
+    },
+  );
+}
+
+function registerExecutorTool(server: McpServer): void {
+  server.registerTool(
+    'execute_migration',
+    {
+      title: 'Execute approved production migration',
+      description: 'DESTRUCTIVE / HUMAN-GATED. Verify a signed exact-action approval, single-use nonce, baseline fingerprint, atomic SQL policy, and expected post-fingerprint before committing production DDL.',
+      inputSchema: {
+        migration_sql: z.string().min(1),
+        verification_assertions: z.array(assertionSchema).min(1).max(20),
+        approval_token: approvalSchema,
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (input) => {
+      try { return successResult(await executeMigration(input)); } catch (error) { return errorResult(error); }
+    },
+  );
+}
+
+function createServer(role: Exclude<ProcessRole, 'cli'>): McpServer {
+  const server = new McpServer({
+    name: role === 'core' ? 'schemaforge-core' : 'schemaforge-executor',
+    version: VERSION,
+  });
+  if (role === 'core') registerCoreTools(server);
+  else registerExecutorTool(server);
+  return server;
+}
+
+function requestedRole(): Exclude<ProcessRole, 'cli'> {
+  const roleIndex = process.argv.indexOf('--role');
+  const role = roleIndex >= 0 ? process.argv[roleIndex + 1] : process.env.SF_PROCESS_ROLE ?? 'core';
+  if (role !== 'core' && role !== 'executor') {
+    throw new Error('--role must be core or executor.');
+  }
+  return role;
+}
+
+function authorized(header: string | undefined, apiKey: string | undefined): boolean {
+  if (!apiKey) return true;
+  if (!header?.startsWith('Bearer ')) return false;
+  const supplied = Buffer.from(header.slice('Bearer '.length));
+  const expected = Buffer.from(apiKey);
+  return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+}
+
+async function main(): Promise<void> {
+  const role = requestedRole();
+  const config = loadConfig(role);
+  db.configure(role);
+  const port = portForRole(config);
+  const app = createMcpExpressApp({ host: config.SF_HTTP_HOST });
+
+  app.get('/health', (_request, response) => {
+    response.json({ status: 'ok', service: `schemaforge-${role}`, version: VERSION });
+  });
+
+  app.use('/mcp', (request, response, next) => {
+    if (!authorized(request.header('authorization'), config.SF_MCP_API_KEY)) {
+      response.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    next();
+  });
+
+  app.post('/mcp', async (request, response) => {
+    const server = createServer(role);
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    try {
+      await server.connect(transport);
+      response.on('close', () => {
+        void transport.close();
+        void server.close();
+      });
+      await transport.handleRequest(request, response, request.body);
+    } catch (error) {
+      console.error(`[SchemaForge:${role}] MCP request failed:`, error);
+      if (!response.headersSent) {
+        response.status(500).json({
+          jsonrpc: '2.0',
+          error: { code: -32603, message: 'Internal server error' },
+          id: null,
+        });
+      }
+    }
+  });
+
+  app.get('/mcp', (_request, response) => {
+    response.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
+  });
+  app.delete('/mcp', (_request, response) => {
+    response.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
+  });
+
+  const httpServer = app.listen(port, config.SF_HTTP_HOST, () => {
+    console.error(`[SchemaForge:${role}] v${VERSION} ready at http://${config.SF_HTTP_HOST}:${port}/mcp`);
+  });
+
+  const shutdown = async (signal: string): Promise<void> => {
+    console.error(`[SchemaForge:${role}] ${signal}; shutting down.`);
+    httpServer.close();
+    await db.close();
+    process.exit(0);
+  };
+  process.once('SIGINT', () => void shutdown('SIGINT'));
+  process.once('SIGTERM', () => void shutdown('SIGTERM'));
+}
+
+main().catch((error) => {
+  console.error('[SchemaForge] Fatal error:', error);
   process.exit(1);
 });

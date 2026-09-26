@@ -1,35 +1,19 @@
 #!/usr/bin/env bash
-# ============================================================================
-# SchemaForge v2.0 — Quick Shadow Database Reset
-# Convenience wrapper: sets shadow DB connection defaults and delegates to
-# validate-migration.sh for the full drop → seed → verify cycle.
-# ============================================================================
-
+# Explicitly reset the disposable local shadow database.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# ---------------------------------------------------------------------------
-# Shadow DB connection defaults (override via environment if needed)
-# ---------------------------------------------------------------------------
 export PGHOST="${PGHOST:-localhost}"
 export PGPORT="${PGPORT:-5434}"
-export PGUSER="${PGUSER:-postgres}"
-export PGPASSWORD="${PGPASSWORD:-postgres}"
+export PGUSER="${PGUSER:-sf_shadow}"
+export PGPASSWORD="${PGPASSWORD:-sf_shadow_pass}"
 export PGDATABASE="${PGDATABASE:-schemaforge_shadow}"
+export SCHEMAFORGE_CONFIRM_RESET="${SCHEMAFORGE_CONFIRM_RESET:-}"
 
-echo "╔══════════════════════════════════════════════╗"
-echo "║   SchemaForge v2.0 — Shadow DB Reset         ║"
-echo "║   Host: ${PGHOST}:${PGPORT}                        ║"
-echo "║   Database: ${PGDATABASE}            ║"
-echo "╚══════════════════════════════════════════════╝"
-echo ""
-
-# ---------------------------------------------------------------------------
-# Delegate to the full validation script
-# ---------------------------------------------------------------------------
-if [[ ! -x "${SCRIPT_DIR}/validate-migration.sh" ]]; then
-    chmod +x "${SCRIPT_DIR}/validate-migration.sh" 2>/dev/null || true
+if [[ "${SCHEMAFORGE_CONFIRM_RESET}" != "YES" ]]; then
+  echo "Refusing destructive shadow reset. Re-run with SCHEMAFORGE_CONFIRM_RESET=YES." >&2
+  exit 2
 fi
 
+printf 'SchemaForge shadow reset: %s@%s:%s/%s\n' "$PGUSER" "$PGHOST" "$PGPORT" "$PGDATABASE"
 exec "${SCRIPT_DIR}/validate-migration.sh"

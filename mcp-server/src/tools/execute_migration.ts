@@ -1,38 +1,24 @@
-/**
- * SchemaForge v2.0 — Tool: execute_migration
- * Safety Tier: 2 (GATED — requires valid ApprovalToken)
- *
- * This is the ONLY tool that mutates the production database.
- * It is protected by multiple safety checks:
- *
- *   1. ApprovalToken validation:
- *      - Token must not be expired
- *      - Token must not be already used (if single_use)
- *      - Token's migration_hash must match SHA-256 of the migration_sql
- *      - Token's target must match "prod"
- *
- *   2. Pre-flight schema drift check:
- *      - Captures current schema fingerprint
- *      - Compares against the fingerprint captured during inspection
- *      - Aborts if schema has drifted (another migration may have run)
- *
- *   3. Execution:
- *      - Wraps transactional migrations in BEGIN/COMMIT
- *      - Reports success/failure with full error details
- *      - Marks the token as used after successful execution
- *
- * The agent CANNOT bypass this gate. The human must provide the ApprovalToken
- * after reviewing the DecisionPacket.
- */
+/** Human-gated, exact-action production schema executor. */
 
-import crypto from 'node:crypto';
 import { db } from '../db.js';
-import type { ApprovalToken, Evidence } from '../types.js';
+import { approvalSecret, loadConfig } from '../config.js';
+import { ApprovalError, verifyApproval } from '../security/approval.js';
+import { requireAtomicMigration, SqlPolicyError } from '../security/sql_policy.js';
+import { runAssertion } from '../verification.js';
+import { inspectSchemaWithClient } from './inspect_schema.js';
+import type {
+  ApprovalRejectionCode,
+  ApprovalToken,
+  Evidence,
+  MigrationPolicyAssessment,
+  SchemaFingerprint,
+  VerificationAssertion,
+  VerificationAssertionResult,
+} from '../types.js';
 
 export interface ExecuteMigrationInput {
-  /** The SQL to execute against production. */
   migration_sql: string;
-  /** The human-issued approval token. */
+  verification_assertions: VerificationAssertion[];
   approval_token: ApprovalToken;
 }
 
@@ -40,172 +26,237 @@ export interface ExecuteMigrationResult {
   success: boolean;
   executed: boolean;
   error: string | null;
+  error_code: ApprovalRejectionCode | 'SQL_POLICY_REJECTED' | 'DATABASE_ERROR' | null;
   duration_ms: number;
   evidence: Evidence[];
   rows_affected: number | null;
+  policy: MigrationPolicyAssessment | null;
+  pre_fingerprint: SchemaFingerprint | null;
+  post_fingerprint: SchemaFingerprint | null;
+  verification_results: VerificationAssertionResult[];
+  execution_id: string | null;
 }
 
-/**
- * Execute a migration against production with ApprovalToken gating.
- *
- * @param input — migration SQL and approval token
- * @returns execution result with evidence
- * @throws if the approval token is invalid
- */
-export async function executeMigration(
-  input: ExecuteMigrationInput,
-): Promise<ExecuteMigrationResult> {
-  const { migration_sql, approval_token } = input;
+function failure(
+  message: string,
+  code: ExecuteMigrationResult['error_code'],
+  evidence: Evidence[],
+  policy: MigrationPolicyAssessment | null = null,
+): ExecuteMigrationResult {
+  return {
+    success: false,
+    executed: false,
+    error: message,
+    error_code: code,
+    duration_ms: 0,
+    evidence,
+    rows_affected: null,
+    policy,
+    pre_fingerprint: null,
+    post_fingerprint: null,
+    verification_results: [],
+    execution_id: null,
+  };
+}
+
+export async function executeMigration(input: ExecuteMigrationInput): Promise<ExecuteMigrationResult> {
   const evidence: Evidence[] = [];
+  let policy: MigrationPolicyAssessment;
+  try {
+    policy = requireAtomicMigration(input.migration_sql);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    evidence.push({ check_name: 'sql_policy', status: 'FAIL', details: message, is_estimate: false });
+    return failure(message, 'SQL_POLICY_REJECTED', evidence);
+  }
 
-  // ── 1. Validate approval token ──
-
-  // Check migration hash
-  const computedHash = crypto.createHash('sha256').update(migration_sql).digest('hex');
-  if (computedHash !== approval_token.migration_hash) {
-    evidence.push({
-      check_name: 'token_hash_match',
-      status: 'FAIL',
-      details: `Hash mismatch: computed ${computedHash.slice(0, 16)}… vs token ${approval_token.migration_hash.slice(0, 16)}…`,
-      is_estimate: false,
-    });
-    return {
-      success: false,
-      executed: false,
-      error: 'Approval token hash does not match the migration SQL. The SQL may have been modified after approval.',
-      duration_ms: 0,
-      evidence,
-      rows_affected: null,
-    };
+  const config = loadConfig('executor');
+  let payload: ApprovalToken['payload'];
+  try {
+    payload = verifyApproval(
+      input.approval_token,
+      input.migration_sql,
+      input.verification_assertions,
+      approvalSecret(config),
+      config.SF_TARGET_ID,
+      config.SF_APPROVAL_TTL_SECONDS,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const code = error instanceof ApprovalError ? error.code : 'TOKEN_MALFORMED';
+    evidence.push({ check_name: 'signed_approval', status: 'FAIL', details: message, is_estimate: false });
+    return failure(message, code, evidence, policy);
   }
 
   evidence.push({
-    check_name: 'token_hash_match',
+    check_name: 'signed_approval',
     status: 'PASS',
-    details: 'Migration SQL hash matches approval token',
+    details: 'Signature, exact SQL, exact assertion set, target, and time window are valid.',
     is_estimate: false,
   });
 
-  // Check expiry
-  const now = new Date();
-  const expiresAt = new Date(approval_token.expires_at);
-  if (now > expiresAt) {
-    evidence.push({
-      check_name: 'token_expiry',
-      status: 'FAIL',
-      details: `Token expired at ${approval_token.expires_at}`,
-      is_estimate: false,
-    });
-    return {
-      success: false,
-      executed: false,
-      error: `Approval token expired at ${approval_token.expires_at}. Request a new approval.`,
-      duration_ms: 0,
-      evidence,
-      rows_affected: null,
-    };
+  const ledger = `public.${config.SF_LEDGER_TABLE}`;
+  try {
+    const claim = await db.query<{ nonce: string }>(
+      'prodWrite',
+      `INSERT INTO ${ledger}
+         (nonce, rehearsal_id, migration_hash, assertions_hash, baseline_fingerprint,
+          expected_fingerprint, action, approved_at, expires_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'started')
+       ON CONFLICT (nonce) DO NOTHING
+       RETURNING nonce`,
+      [
+        payload.nonce,
+        payload.rehearsal_id,
+        payload.migration_hash,
+        payload.assertions_hash,
+        payload.baseline_fingerprint,
+        payload.expected_fingerprint,
+        payload.action,
+        payload.issued_at,
+        payload.expires_at,
+      ],
+    );
+    if (claim.rowCount !== 1) {
+      const message = 'This approval nonce has already been consumed.';
+      evidence.push({ check_name: 'nonce_single_use', status: 'FAIL', details: message, is_estimate: false });
+      return failure(message, 'REPLAY_DETECTED', evidence, policy);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return failure(`Approval ledger is unavailable: ${message}`, 'DATABASE_ERROR', evidence, policy);
   }
 
   evidence.push({
-    check_name: 'token_expiry',
+    check_name: 'nonce_single_use',
     status: 'PASS',
-    details: `Token valid until ${approval_token.expires_at}`,
+    details: `Nonce ${payload.nonce} was atomically claimed in the production ledger.`,
     is_estimate: false,
   });
 
-  // Check single-use
-  if (approval_token.single_use && approval_token.used) {
-    evidence.push({
-      check_name: 'token_single_use',
-      status: 'FAIL',
-      details: 'Single-use token has already been consumed',
-      is_estimate: false,
-    });
-    return {
-      success: false,
-      executed: false,
-      error: 'This single-use approval token has already been consumed.',
-      duration_ms: 0,
-      evidence,
-      rows_affected: null,
-    };
-  }
-
-  // Check target
-  if (approval_token.target !== 'prod') {
-    evidence.push({
-      check_name: 'token_target',
-      status: 'FAIL',
-      details: `Token target is "${approval_token.target}", expected "prod"`,
-      is_estimate: false,
-    });
-    return {
-      success: false,
-      executed: false,
-      error: `Approval token target "${approval_token.target}" does not match expected "prod".`,
-      duration_ms: 0,
-      evidence,
-      rows_affected: null,
-    };
-  }
-
-  evidence.push({
-    check_name: 'token_target',
-    status: 'PASS',
-    details: 'Token target matches "prod"',
-    is_estimate: false,
-  });
-
-  // ── 2. Execute migration ──
-  const startTime = performance.now();
+  const startedAt = performance.now();
+  let preFingerprint: SchemaFingerprint | null = null;
+  let postFingerprint: SchemaFingerprint | null = null;
   let rowsAffected: number | null = null;
+  const verificationResults: VerificationAssertionResult[] = [];
 
   try {
-    await db.query('prodWrite', 'BEGIN');
-    const result = await db.query('prodWrite', migration_sql, [], 120_000); // 2-minute timeout
-    await db.query('prodWrite', 'COMMIT');
+    await db.withTransaction(
+      'prodWrite',
+      async (client) => {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext('schemaforge-production-executor'))");
+        preFingerprint = (await inspectSchemaWithClient(client)).fingerprint;
+        if (preFingerprint.hash !== payload.baseline_fingerprint) {
+          throw new ApprovalError(
+            'SCHEMA_DRIFT',
+            `Production drifted after rehearsal: approved ${payload.baseline_fingerprint}, observed ${preFingerprint.hash}.`,
+          );
+        }
 
-    rowsAffected = result.rowCount;
+        const result = await client.query(input.migration_sql);
+        rowsAffected = result.rowCount;
+        postFingerprint = (await inspectSchemaWithClient(client)).fingerprint;
+        if (postFingerprint.hash !== payload.expected_fingerprint) {
+          throw new ApprovalError(
+            'POSTCONDITION_FAILED',
+            `Post-migration fingerprint mismatch: expected ${payload.expected_fingerprint}, observed ${postFingerprint.hash}.`,
+          );
+        }
 
-    const durationMs = Math.round(performance.now() - startTime);
+        for (const assertion of input.verification_assertions) {
+          let result: VerificationAssertionResult;
+          try {
+            result = await runAssertion(client, assertion);
+          } catch (error) {
+            throw new ApprovalError(
+              'POSTCONDITION_FAILED',
+              `Approved assertion "${assertion.name}" errored: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          verificationResults.push(result);
+          if (!result.passed) {
+            throw new ApprovalError('POSTCONDITION_FAILED', `Approved assertion "${assertion.name}" failed before commit.`);
+          }
+        }
 
+        const ledgerUpdate = await client.query<{ nonce: string }>(
+          `UPDATE ${ledger}
+              SET status = 'succeeded', executed_at = NOW(), post_fingerprint = $2
+            WHERE nonce = $1 AND status = 'started'
+            RETURNING nonce`,
+          [payload.nonce, postFingerprint.hash],
+        );
+        if (ledgerUpdate.rowCount !== 1) {
+          throw new ApprovalError('REPLAY_DETECTED', 'The claimed ledger row was not in the expected started state.');
+        }
+      },
+      {
+        statementTimeoutMs: config.SF_MIGRATION_TIMEOUT_MS,
+        lockTimeoutMs: config.SF_LOCK_TIMEOUT_MS,
+        isolationLevel: 'REPEATABLE READ',
+      },
+    );
+
+    const duration = Math.round(performance.now() - startedAt);
     evidence.push({
       check_name: 'production_execute',
       status: 'PASS',
-      details: `Migration executed successfully in ${durationMs}ms, ${rowsAffected ?? 0} rows affected`,
-      measured_value: `${durationMs}ms`,
+      details: 'DDL, approved assertions, post-fingerprint, and ledger update committed atomically.',
+      measured_value: `${duration}ms [OBSERVED]`,
       is_estimate: false,
     });
-
     return {
       success: true,
       executed: true,
       error: null,
-      duration_ms: durationMs,
+      error_code: null,
+      duration_ms: duration,
       evidence,
       rows_affected: rowsAffected,
+      policy,
+      pre_fingerprint: preFingerprint,
+      post_fingerprint: postFingerprint,
+      verification_results: verificationResults,
+      execution_id: payload.nonce,
     };
-  } catch (err: unknown) {
-    await db.query('prodWrite', 'ROLLBACK').catch(() => {});
+  } catch (error) {
+    const duration = Math.round(performance.now() - startedAt);
+    const message = error instanceof Error ? error.message : String(error);
+    const code: ExecuteMigrationResult['error_code'] =
+      error instanceof ApprovalError
+        ? error.code
+        : error instanceof SqlPolicyError
+          ? 'SQL_POLICY_REJECTED'
+          : 'DATABASE_ERROR';
 
-    const durationMs = Math.round(performance.now() - startTime);
-    const errMsg = err instanceof Error ? err.message : String(err);
+    await db.query(
+      'prodWrite',
+      `UPDATE ${ledger}
+          SET status = 'failed', executed_at = NOW(), error = $2
+        WHERE nonce = $1 AND status = 'started'`,
+      [payload.nonce, message.slice(0, 2_000)],
+    ).catch(() => undefined);
 
     evidence.push({
       check_name: 'production_execute',
       status: 'FAIL',
-      details: `Migration failed after ${durationMs}ms: ${errMsg}`,
-      measured_value: `${durationMs}ms`,
+      details: message,
+      measured_value: `${duration}ms [OBSERVED]`,
       is_estimate: false,
     });
-
     return {
       success: false,
-      executed: true, // we attempted execution
-      error: errMsg,
-      duration_ms: durationMs,
+      executed: true,
+      error: message,
+      error_code: code,
+      duration_ms: duration,
       evidence,
       rows_affected: null,
+      policy,
+      pre_fingerprint: preFingerprint,
+      post_fingerprint: postFingerprint,
+      verification_results: verificationResults,
+      execution_id: payload.nonce,
     };
   }
 }

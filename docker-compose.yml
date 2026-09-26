@@ -1,12 +1,10 @@
-version: "3.9"
-
 services:
   schemaforge-prod:
     image: postgres:16-alpine
     container_name: schemaforge-prod
     restart: unless-stopped
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     environment:
       POSTGRES_DB: schemaforge_prod
       POSTGRES_USER: sf_admin
@@ -14,20 +12,22 @@ services:
     volumes:
       - schemaforge-prod-data:/var/lib/postgresql/data
       - ./docker/init-prod.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./shadow/seed-data.sql:/docker-entrypoint-initdb.d/02-seed-data.sql:ro
+      - ./shadow/seed-edge-cases.sql:/docker-entrypoint-initdb.d/03-seed-edge-cases.sql:ro
     networks:
       - schemaforge-net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U sf_admin -d schemaforge_prod"]
-      interval: 5s
+      interval: 3s
       timeout: 3s
-      retries: 10
+      retries: 20
 
   schemaforge-shadow:
     image: postgres:16-alpine
     container_name: schemaforge-shadow
     restart: unless-stopped
     ports:
-      - "5434:5432"
+      - "127.0.0.1:5434:5432"
     environment:
       POSTGRES_DB: schemaforge_shadow
       POSTGRES_USER: sf_shadow
@@ -35,19 +35,19 @@ services:
     volumes:
       - schemaforge-shadow-data:/var/lib/postgresql/data
       - ./docker/init-shadow.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./shadow/seed-data.sql:/docker-entrypoint-initdb.d/02-seed-data.sql:ro
+      - ./shadow/seed-edge-cases.sql:/docker-entrypoint-initdb.d/03-seed-edge-cases.sql:ro
     networks:
       - schemaforge-net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U sf_shadow -d schemaforge_shadow"]
-      interval: 5s
+      interval: 3s
       timeout: 3s
-      retries: 10
+      retries: 20
 
 volumes:
   schemaforge-prod-data:
-    driver: local
   schemaforge-shadow-data:
-    driver: local
 
 networks:
   schemaforge-net:

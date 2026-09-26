@@ -1,4 +1,4 @@
-# ---- Secrets / local config ----
+# Secrets and role-specific local configuration
 .env
 .env.*
 !.env.example
@@ -7,7 +7,7 @@
 *.p12
 credentials.json
 
-# ---- Node ----
+# Node / build output
 node_modules/
 dist/
 build/
@@ -18,12 +18,14 @@ pnpm-debug.log*
 .npm/
 .yarn/
 
-# ---- Scratch / local tooling ----
+# Runtime and local tool state
+data/
 .tmp/
 tmp/
+.playwright-mcp/
 *.local
 
-# ---- LaTeX build artifacts ----
+# LaTeX intermediates (compiled PDFs remain tracked)
 *.aux
 *.log
 *.out
@@ -39,7 +41,7 @@ tmp/
 *.snm
 *.vrb
 
-# ---- Editor / OS ----
+# Editor / OS
 .vscode/
 .idea/
 *.swp
@@ -53,7 +55,7 @@ $RECYCLE.BIN/
 .Spotlight-V100
 .Trashes
 
-# ---- Logs / coverage ----
+# Logs / coverage
 logs/
 *.log.*
 coverage/

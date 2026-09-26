@@ -1,5 +1,5 @@
 -- ============================================================================
--- SchemaForge v2.0 — Edge Case Seeds for Migration Rehearsal
+-- SchemaForge v2.1 — Shared Edge Cases for Migration Rehearsal
 -- 
 -- PURPOSE: These intentional data anomalies let SchemaForge demonstrate its
 --          ability to detect, report, and remediate violations BEFORE a
@@ -22,7 +22,8 @@ BEGIN;
 -- rather than a contiguous block (which would be unrealistically easy to
 -- spot in a manual review).
 -- **************************************************************************
-UPDATE users SET email = NULL, updated_at = NOW()
+UPDATE users
+SET email = NULL, updated_at = TIMESTAMPTZ '2026-09-20 12:00:00+00'
 WHERE id IN (
      7,   -- Alice Williams
     23,   -- Xander Smith
@@ -84,7 +85,8 @@ VALUES (NULL, 0.00, 'cancelled', TIMESTAMPTZ '2026-09-15 00:00:00+00');
 -- duplicates must be detected. We update 3 existing users to share the
 -- same email address.
 -- **************************************************************************
-UPDATE users SET email = 'duplicate@example.com', updated_at = NOW()
+UPDATE users
+SET email = 'duplicate@example.com', updated_at = TIMESTAMPTZ '2026-09-20 12:05:00+00'
 WHERE id IN (150, 275, 399);
 -- Expected: 3 rows now share the same email, violating any future UNIQUE constraint
 
@@ -96,8 +98,8 @@ WHERE id IN (150, 275, 399);
 -- **************************************************************************
 INSERT INTO products (name, price, category, stock, created_at)
 VALUES
-    ('Budget Item Zero',       0.01, 'Books',       9999, NOW()),
-    ('Luxury Maximum Price', 99999999.99, 'Electronics', 1,    NOW());
+    ('Budget Item Zero',       0.01, 'Books',       9999, TIMESTAMPTZ '2026-09-20 12:10:00+00'),
+    ('Luxury Maximum Price', 99999999.99, 'Electronics', 1, TIMESTAMPTZ '2026-09-20 12:10:00+00');
 -- Min and max representable prices in DECIMAL(10,2)
 
 -- **************************************************************************
