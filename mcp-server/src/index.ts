@@ -89,14 +89,14 @@ export function createMcpServer(): McpServer {
     {
       forward_sql: z.string().describe('The forward migration SQL to rehearse.'),
       rollback_sql: z.string().optional().describe('Optional rollback SQL to verify reversibility.'),
-      verification_queries: z.array(z.string()).describe('Queries to run after forward migration to verify expected state.'),
+      verification_queries: z.array(z.union([z.string(), z.record(z.any())])).describe('Queries to run after forward migration to verify expected state.'),
     },
     async (input) => {
       try {
         const result = await rehearseMigration({
           forward_sql: input.forward_sql,
           rollback_sql: input.rollback_sql,
-          verification_queries: input.verification_queries,
+          verification_queries: input.verification_queries as any,
         });
         return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
       } catch (err: unknown) {

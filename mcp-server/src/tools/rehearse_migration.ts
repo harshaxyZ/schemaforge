@@ -27,7 +27,7 @@ export interface RehearseMigrationInput {
   /** Optional rollback SQL to verify reversibility. */
   rollback_sql?: string;
   /** Queries to run after forward migration to verify expected state. */
-  verification_queries: string[];
+  verification_queries: (string | { query: string; [key: string]: any })[];
 }
 
 export interface VerificationQueryResult {
@@ -126,7 +126,9 @@ export async function rehearseMigration(
   const verificationResults: VerificationQueryResult[] = [];
 
   if (forwardSuccess) {
-    for (const vq of verification_queries) {
+    for (const vqRaw of verification_queries) {
+      const vq = typeof vqRaw === 'string' ? vqRaw : (vqRaw as any)?.query;
+      if (!vq) continue;
       try {
         const result = await db.query('shadow', vq);
         verificationResults.push({
